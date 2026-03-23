@@ -1,8 +1,6 @@
 /**
- * Middleware de autenticación para Supabase
- *
- * Uso en rutas protegidas:
- * router.get('/protected', authMiddleware, controllerFunction)
+ * Middleware de autenticación para Supabase.
+ * Uso en rutas protegidas: router.get('/ruta', authMiddleware, controllerFn)
  */
 
 const { pool } = require('../config/database');
@@ -10,7 +8,6 @@ const jwt = require('jsonwebtoken');
 
 const authMiddleware = async (req, res, next) => {
   try {
-    // Obtener el token del header Authorization
     const authHeader = req.headers.authorization;
     console.log('[AUTH DEBUG] Authorization header:', authHeader ? 'presente' : 'NO presente');
 
@@ -25,7 +22,8 @@ const authMiddleware = async (req, res, next) => {
     const token = authHeader.substring(7);
     console.log('[AUTH DEBUG] Token recibido, primeros 20 caracteres:', token.substring(0, 20));
 
-    // Decodificar token para obtener user_id (sin verificar firma, solo decodificar)
+    // Se decodifica sin verificar firma — la validación real la hace Supabase en el frontend.
+    // Acá solo necesitamos el sub (user id) para buscar el perfil en BD.
     const decoded = jwt.decode(token);
     console.log('[AUTH DEBUG] Token decodificado, sub:', decoded?.sub);
 
@@ -40,7 +38,6 @@ const authMiddleware = async (req, res, next) => {
     const userId = decoded.sub;
     console.log('[AUTH DEBUG] User ID extraído del token:', userId);
 
-    // Obtener rol del usuario desde la tabla profiles usando el ID del token
     console.log('[AUTH DEBUG] Buscando perfil en base de datos...');
     const result = await pool.query(
       'SELECT id, role, name FROM public.profiles WHERE id = $1',
@@ -58,7 +55,6 @@ const authMiddleware = async (req, res, next) => {
     const profile = result.rows[0];
     console.log('[AUTH DEBUG] ✓ Perfil encontrado - ID:', profile.id, 'Rol:', profile.role);
 
-    // Guardar usuario y rol en request para uso en próximos middlewares
     req.user = {
       id: userId,
       name: profile.name,
@@ -78,10 +74,7 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
-/**
- * Middleware para validar rol de administrador
- * Debe usarse DESPUÉS de authMiddleware
- */
+// Debe usarse siempre DESPUÉS de authMiddleware
 const adminMiddleware = (req, res, next) => {
   try {
     if (!req.user) {
@@ -108,13 +101,9 @@ const adminMiddleware = (req, res, next) => {
   }
 };
 
-/**
- * Middleware para manejo de errores de validación
- */
 const errorHandler = (err, req, res, next) => {
   console.error('Error:', err);
-  
-  // Error de base de datos
+
   if (err.code && err.code.startsWith('P')) {
     return res.status(400).json({
       success: false,
@@ -122,8 +111,7 @@ const errorHandler = (err, req, res, next) => {
       ...(process.env.NODE_ENV === 'development' && { error: err.message })
     });
   }
-  
-  // Error genérico
+
   res.status(err.status || 500).json({
     success: false,
     message: err.message || 'Error interno del servidor',

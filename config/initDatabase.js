@@ -3,25 +3,23 @@ const { pool } = require('./database');
 
 const initDatabase = async () => {
   const client = await pool.connect();
-  
+
   try {
     console.log('🔧 Inicializando estructura de base de datos...\n');
 
-    // Verificar si la tabla profiles existe
     const tableExists = await client.query(`
       SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_schema = 'public' 
+        SELECT FROM information_schema.tables
+        WHERE table_schema = 'public'
         AND table_name = 'profiles'
       );
     `);
 
     if (!tableExists.rows[0].exists) {
       console.log('📋 Tabla profiles no existe. Creando...');
-      
-      // Crear tabla profiles compatible con Supabase Auth
-      // El id debe ser UUID referenciando auth.users(id)
-      // Esta tabla se crea automáticamente con el trigger, pero lo dejamos aquí para referencia
+
+      // Esta tabla normalmente la crea el trigger de Supabase Auth automáticamente.
+      // El id referencia auth.users(id) — no usar UUID autogenerado acá.
       await client.query(`
         CREATE TABLE IF NOT EXISTS profiles (
           id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -34,35 +32,32 @@ const initDatabase = async () => {
       console.log('✓ Tabla profiles creada');
     } else {
       console.log('✓ Tabla profiles ya existe en Supabase');
-      
-      // Verificar la estructura de la tabla
+
       const columns = await client.query(`
-        SELECT column_name, data_type 
-        FROM information_schema.columns 
+        SELECT column_name, data_type
+        FROM information_schema.columns
         WHERE table_name = 'profiles' AND table_schema = 'public'
         ORDER BY ordinal_position;
       `);
-      
+
       console.log('  Columnas:');
       columns.rows.forEach(col => {
         console.log(`    - ${col.column_name} (${col.data_type})`);
       });
     }
 
-    // Habilitar Row Level Security si no está habilitado
     console.log('\n🔐 Verificando Row Level Security...');
     await client.query(`
       ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
     `);
     console.log('✓ RLS habilitado en profiles');
 
-    // Verificar política de RLS
     const policies = await client.query(`
-      SELECT policyname 
-      FROM pg_policies 
+      SELECT policyname
+      FROM pg_policies
       WHERE tablename = 'profiles';
     `);
-    
+
     if (policies.rows.length === 0) {
       console.log('📋 Creando política RLS...');
       await client.query(`
@@ -76,11 +71,10 @@ const initDatabase = async () => {
       console.log(`✓ Política RLS ya existe: ${policies.rows.map(p => p.policyname).join(', ')}`);
     }
 
-    // Verificar función de trigger
     console.log('\n⚙️ Verificando función y trigger...');
     const functionExists = await client.query(`
       SELECT EXISTS (
-        SELECT 1 FROM pg_proc 
+        SELECT 1 FROM pg_proc
         WHERE proname = 'handle_new_user'
       );
     `);
@@ -102,10 +96,9 @@ const initDatabase = async () => {
       console.log('✓ Función handle_new_user ya existe');
     }
 
-    // Verificar trigger
     const triggerExists = await client.query(`
       SELECT EXISTS (
-        SELECT 1 FROM pg_trigger 
+        SELECT 1 FROM pg_trigger
         WHERE tgname = 'on_auth_user_created'
       );
     `);
@@ -124,14 +117,12 @@ const initDatabase = async () => {
       console.log('✓ Trigger on_auth_user_created ya existe');
     }
 
-    // Crear índices para mejor rendimiento
     console.log('\n📊 Verificando índices...');
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_profiles_role ON profiles(role);
     `);
     console.log('✓ Índices verificados');
 
-    // Crear tabla carousel_images si no existe
     console.log('\n🖼️  Verificando tabla carousel_images...');
     await client.query(`
       CREATE TABLE IF NOT EXISTS public.carousel_images (
@@ -144,7 +135,6 @@ const initDatabase = async () => {
     `);
     console.log('✓ Tabla carousel_images verificada');
 
-    // Agregar columnas a la tabla productos (si ya existe)
     console.log('\n📦 Verificando columnas de la tabla productos...');
     const productosExists = await client.query(`
       SELECT EXISTS (
@@ -176,9 +166,35 @@ const initDatabase = async () => {
       console.log('ℹ️  Tabla productos no encontrada (se crea desde Supabase)');
     }
 
+    console.log('\n🛒 Verificando tabla pedidos...');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.pedidos (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        product_id TEXT,
+        product_name TEXT NOT NULL,
+        product_image TEXT,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        unit_price NUMERIC(10,2) NOT NULL,
+        total_price NUMERIC(10,2) NOT NULL,
+        units_config JSONB,
+        payment_method TEXT DEFAULT 'pending',
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','confirmed','shipped','delivered','cancelled')),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_pedidos_status ON public.pedidos(status);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_pedidos_created_at ON public.pedidos(created_at DESC);
+    `);
+    console.log('✓ Tabla pedidos verificada');
+
     console.log('\n✅ Base de datos inicializada correctamente');
     console.log('📌 Ahora puedes usar el servidor con: npm run dev');
-    
+
   } catch (error) {
     console.error('\n❌ Error al inicializar la base de datos:');
     console.error(`   Mensaje: ${error.message}`);
@@ -191,7 +207,6 @@ const initDatabase = async () => {
   }
 };
 
-// Ejecutar si se llama directamente
 if (require.main === module) {
   initDatabase();
 }

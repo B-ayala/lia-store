@@ -3,8 +3,8 @@ const https = require('https');
 
 const generateSignature = (req, res) => {
   try {
-    // Widget sends the exact params it wants to sign in the request body
-    // e.g. { folder: 'productos', timestamp: 1234567890, upload_preset: 'Liastore', source: 'uw', ... }
+    // El widget manda exactamente los parámetros que quiere firmar en el body
+    // (ej: folder, timestamp, upload_preset, source, etc.)
     const paramsToSign = req.body;
 
     if (!paramsToSign || Object.keys(paramsToSign).length === 0) {
@@ -14,7 +14,7 @@ const generateSignature = (req, res) => {
       });
     }
 
-    // Cloudinary signature: sort keys alphabetically, concatenate "key=value&...", append API_SECRET
+    // Firma Cloudinary: ordenar keys alfabéticamente, concatenar "key=value&...", agregar API_SECRET al final
     const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
     const signatureString =
       Object.keys(paramsToSign)
@@ -22,7 +22,6 @@ const generateSignature = (req, res) => {
         .map((key) => `${key}=${paramsToSign[key]}`)
         .join('&') + apiSecret;
 
-    // SHA1 hash
     const signature = crypto
       .createHash('sha1')
       .update(signatureString)
@@ -57,7 +56,6 @@ const deleteImage = async (req, res) => {
       });
     }
 
-    // Create auth string for Cloudinary API
     const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
     const auth = Buffer.from(
       `${process.env.CLOUDINARY_API_KEY}:${apiSecret}`
@@ -166,7 +164,6 @@ const getImages = async (req, res) => {
   }
 };
 
-// Helper: make a Cloudinary Admin API request
 const cloudinaryRequest = (method, path, body) => {
   return new Promise((resolve, reject) => {
     const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');

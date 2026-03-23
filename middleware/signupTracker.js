@@ -1,11 +1,11 @@
-// In-memory tracker for signup rate limits per email.
-// Only records when Supabase actually returns a rate limit error.
-// Read operations never modify state.
+// Tracker en memoria para rate limits de signup por email.
+// Solo registra eventos cuando Supabase devuelve un error de rate limit.
+// Las lecturas nunca modifican el estado.
 
 const store = new Map(); // email -> { count, cooldownUntil, windowStart }
 
-const WINDOW_MS  = 60 * 60 * 1000; // 1 hour — after this, reset count
-const COOLDOWN_MS = 60 * 1000;     // 60s cooldown after each Supabase rate limit
+const WINDOW_MS  = 60 * 60 * 1000; // 1 hora — después de esto se resetea el contador
+const COOLDOWN_MS = 60 * 1000;     // 60s de cooldown tras cada rate limit de Supabase
 const MAX_RATE_LIMITS = 6;
 
 const getRecord = (email) => {
@@ -13,7 +13,7 @@ const getRecord = (email) => {
   const now = Date.now();
   const record = store.get(key);
   if (!record || now - record.windowStart > WINDOW_MS) {
-    return null; // no record or expired
+    return null;
   }
   return record;
 };
@@ -32,15 +32,10 @@ const buildStatus = (record) => {
   };
 };
 
-/**
- * Read-only: returns current rate limit status for the email without modifying anything.
- */
+/** Solo lectura: devuelve el estado actual de rate limit sin modificar nada. */
 const getStatus = (email) => buildStatus(getRecord(email));
 
-/**
- * Called only when Supabase returned a rate limit error.
- * Records the event and sets a 60s cooldown.
- */
+/** Llamar únicamente cuando Supabase devolvió un error de rate limit. */
 const recordRateLimit = (email) => {
   const key = email.toLowerCase().trim();
   const now = Date.now();

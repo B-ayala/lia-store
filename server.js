@@ -1,5 +1,5 @@
 const dotenv = require('dotenv');
-// Cargar variables de entorno ANTES de importar módulos que las usen
+// dotenv.config() debe ir ANTES de importar cualquier módulo que lea process.env
 dotenv.config();
 
 const express = require('express');
@@ -8,16 +8,17 @@ const { connectDB } = require('./config/database');
 const userRoutes = require('./routes/userRoutes');
 const cloudinaryRoutes = require('./routes/cloudinaryRoutes');
 const productRoutes = require('./routes/productRoutes');
+const ordersRoutes = require('./routes/ordersRoutes');
+const shippingRoutes = require('./routes/shippingRoutes');
 
 const app = express();
 
-// Middleware
 app.use(cors({
   origin: function (origin, callback) {
     const allowed = (process.env.FRONTEND_URL || 'http://localhost:5173')
       .split(',')
       .map(u => u.trim());
-    // Allow requests with no origin (Postman, curl, same-origin)
+    // Permitir requests sin origin (Postman, curl, mismo origen)
     if (!origin || allowed.includes(origin)) {
       callback(null, true);
     } else {
@@ -26,56 +27,51 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning']
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rutas
 app.use('/api/users', userRoutes);
 app.use('/api/cloudinary', cloudinaryRoutes);
 app.use('/api/products', productRoutes);
+app.use('/api/orders', ordersRoutes);
+app.use('/api/shipping', shippingRoutes);
 
-// Ruta base
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     message: 'API MVC con Node.js y PostgreSQL/Supabase',
     version: '1.0.0'
   });
 });
 
-// Ruta de health check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// Manejo de rutas no encontradas
 app.use((req, res) => {
-  res.status(404).json({ 
+  res.status(404).json({
     success: false,
-    message: 'Ruta no encontrada' 
+    message: 'Ruta no encontrada'
   });
 });
 
-// Manejo de errores global
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({
     success: false,
-    message: process.env.NODE_ENV === 'production' 
-      ? 'Error interno del servidor' 
+    message: process.env.NODE_ENV === 'production'
+      ? 'Error interno del servidor'
       : err.message
   });
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Iniciar servidor solo después de conectar a BD
 (async () => {
   try {
-    // Conectar a PostgreSQL/Supabase
     await connectDB();
-    
+
     app.listen(PORT, () => {
       console.log(`\n✅ Servidor iniciado correctamente`);
       console.log(`🚀 Escuchando en puerto ${PORT}`);

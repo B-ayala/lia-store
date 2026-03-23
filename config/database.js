@@ -9,7 +9,6 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false
   },
-  // Configuración del pool
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
@@ -17,7 +16,6 @@ const pool = new Pool({
 
 let isConnected = false;
 
-// Verificar conexión
 pool.on('connect', () => {
   console.log(`📡 PostgreSQL conectado a ${process.env.DB_HOST}:${process.env.DB_PORT}`);
 });
@@ -32,22 +30,21 @@ const connectDB = async (retries = 3) => {
     try {
       const client = await pool.connect();
       console.log('✓ Conexión a PostgreSQL/Supabase establecida correctamente');
-      
-      // Verificar que la tabla profiles existe
+
       const tableCheck = await client.query(`
         SELECT EXISTS (
-          SELECT FROM information_schema.tables 
-          WHERE table_schema = 'public' 
+          SELECT FROM information_schema.tables
+          WHERE table_schema = 'public'
           AND table_name = 'profiles'
         );
       `);
-      
+
       if (!tableCheck.rows[0].exists) {
         console.warn('⚠️ Tabla profiles no existe. Ejecuta: npm run init-db');
       } else {
         console.log('✓ Tabla profiles verificada');
       }
-      
+
       client.release();
       isConnected = true;
       return pool;
@@ -59,7 +56,7 @@ const connectDB = async (retries = 3) => {
       console.error(`   Mensaje: ${error.message || 'Sin mensaje'}`);
       console.error(`   Código: ${error.code || 'UNKNOWN'}`);
       if (error.detail) console.error(`   Detalle: ${error.detail}`);
-      
+
       if (attempt < retries) {
         console.log(`   ⏳ Reintentando en 2 segundos...\n`);
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -82,7 +79,6 @@ const connectDB = async (retries = 3) => {
   }
 };
 
-// Verificar estado de conexión
 const isDBConnected = () => {
   return isConnected;
 };

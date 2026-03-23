@@ -1,17 +1,13 @@
 const { pool } = require('../config/database');
 
 class User {
-  /**
-   * Encontrar usuario por ID (UUID de Supabase)
-   * Con Supabase, el ID es el UUID de auth.users
-   */
   static async findById(id) {
     try {
       const query = `
-        SELECT 
-          p.id, 
-          p.name, 
-          p.role, 
+        SELECT
+          p.id,
+          p.name,
+          p.role,
           p.created_at,
           u.email
         FROM public.profiles p
@@ -25,29 +21,26 @@ class User {
     }
   }
 
-  /**
-   * Obtener todos los usuarios
-   */
   static async findAll(limit = 50, offset = 0) {
     try {
       const query = `
-        SELECT 
-          p.id, 
-          p.name, 
-          p.role, 
+        SELECT
+          p.id,
+          p.name,
+          p.role,
           p.created_at,
           u.email,
           u.email_confirmed_at
         FROM public.profiles p
         LEFT JOIN auth.users u ON p.id = u.id
-        ORDER BY p.created_at DESC 
+        ORDER BY p.created_at DESC
         LIMIT $1 OFFSET $2
       `;
       const result = await pool.query(query, [limit, offset]);
-      
+
       const countQuery = 'SELECT COUNT(*) as count FROM public.profiles';
       const countResult = await pool.query(countQuery);
-      
+
       return {
         users: result.rows,
         total: parseInt(countResult.rows[0].count),
@@ -59,10 +52,8 @@ class User {
     }
   }
 
-  /**
-   * NOTA: Crear usuario debe hacerse a través de Supabase Auth en el frontend
-   * El trigger automáticamente crea el perfil en public.profiles
-   */
+  // Crear usuarios debe hacerse vía supabase.auth.signUp() en el frontend.
+  // El trigger on_auth_user_created crea el perfil en public.profiles automáticamente.
   static async create(userData) {
     throw new Error(
       'La creación de usuarios debe hacerse a través de Supabase Auth en el frontend. ' +
@@ -70,12 +61,9 @@ class User {
     );
   }
 
-  /**
-   * Actualizar perfil de usuario
-   */
   static async findByIdAndUpdate(id, updateData) {
     const client = await pool.connect();
-    
+
     try {
       await client.query('BEGIN');
 
@@ -108,8 +96,8 @@ class User {
 
       values.push(id);
       const query = `
-        UPDATE public.profiles 
-        SET ${updates.join(', ')} 
+        UPDATE public.profiles
+        SET ${updates.join(', ')}
         WHERE id = $${paramCount}
         RETURNING id, name, role, created_at
       `;
@@ -131,12 +119,9 @@ class User {
     }
   }
 
-  /**
-   * Eliminar usuario
-   */
   static async findByIdAndDelete(id) {
     const client = await pool.connect();
-    
+
     try {
       await client.query('BEGIN');
 
@@ -147,7 +132,7 @@ class User {
         throw new Error('Usuario no encontrado');
       }
 
-      // También eliminar de auth.users para borrar completamente la cuenta
+      // Eliminar también de auth.users para borrar la cuenta completamente de Supabase
       await client.query('DELETE FROM auth.users WHERE id = $1', [id]);
 
       await client.query('COMMIT');

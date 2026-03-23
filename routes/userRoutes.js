@@ -12,17 +12,13 @@ const {
   signupRateLimit
 } = require('../controllers/userController');
 
-// Signup rate limit tracker
 router.get('/signup-status/:email', signupStatus);
 router.post('/signup-ratelimit', signupRateLimit);
 
-// Ruta de login
 router.post('/login', loginUser);
 
-// Ruta para obtener usuario por Supabase Auth ID
 router.get('/auth/:userId', getUserByAuthId);
 
-// Rutas CRUD principales
 router.route('/')
   .get(getUsers)
   .post(createUser);

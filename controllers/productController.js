@@ -1,6 +1,5 @@
 const { pool } = require('../config/database');
 
-// Create product
 const createProduct = async (req, res) => {
   try {
     const {
@@ -17,7 +16,7 @@ const createProduct = async (req, res) => {
       });
     }
 
-    // Derive imageUrl from images array if provided
+    // image_url se deriva del primer elemento del array images si se provee
     const resolvedImageUrl = (images && images.length > 0) ? images[0] : (imageUrl || '');
     const resolvedPublicId = publicId || '';
 
@@ -63,7 +62,6 @@ const createProduct = async (req, res) => {
   }
 };
 
-// Get all products
 const getProducts = async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -96,7 +94,6 @@ const getProducts = async (req, res) => {
   }
 };
 
-// Get product by id
 const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -126,7 +123,6 @@ const getProductById = async (req, res) => {
   }
 };
 
-// Update product
 const updateProduct = async (req, res) => {
   try {
     const { id } = req.params;
@@ -137,7 +133,6 @@ const updateProduct = async (req, res) => {
       status, images,
     } = req.body;
 
-    // Build dynamic update query
     const updates = [];
     const values = [];
     let paramCount = 1;
@@ -161,7 +156,7 @@ const updateProduct = async (req, res) => {
     if (images !== undefined) {
       updates.push(`images = $${paramCount++}`);
       values.push(JSON.stringify(images));
-      // Keep image_url in sync with first image
+      // image_url se mantiene sincronizado con el primer elemento de images
       const firstImage = (images && images.length > 0) ? images[0] : (imageUrl || '');
       updates.push(`image_url = $${paramCount++}`);
       values.push(firstImage);
@@ -250,12 +245,10 @@ const updateProduct = async (req, res) => {
   }
 };
 
-// Delete product (and Cloudinary image)
 const deleteProduct = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Get product to find public_id
     const productResult = await pool.query(
       'SELECT public_id FROM public.productos WHERE id = $1',
       [id]
@@ -270,7 +263,6 @@ const deleteProduct = async (req, res) => {
 
     const productData = productResult.rows[0];
 
-    // Delete from Cloudinary via our endpoint
     if (productData.public_id) {
       try {
         const https = require('https');
@@ -316,12 +308,11 @@ const deleteProduct = async (req, res) => {
           request.end();
         });
       } catch (cloudinaryError) {
+        // Si Cloudinary falla, no se cancela el borrado del producto en BD
         console.warn('Cloudinary deletion warning:', cloudinaryError.message);
-        // Don't fail if Cloudinary deletion fails, just warn
       }
     }
 
-    // Delete from PostgreSQL
     await pool.query('DELETE FROM public.productos WHERE id = $1', [id]);
 
     res.json({

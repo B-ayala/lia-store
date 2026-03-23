@@ -9,11 +9,11 @@ const {
 } = require('../controllers/productController');
 const { authMiddleware, adminMiddleware } = require('../middleware/authMiddleware');
 
-// Public routes
+// Rutas públicas
 router.get('/', getProducts);
 router.get('/:id', getProductById);
 
-// Protected routes (admin only)
+// Rutas protegidas (solo admin)
 router.post('/', authMiddleware, adminMiddleware, createProduct);
 router.put('/:id', authMiddleware, adminMiddleware, updateProduct);
 router.delete('/:id', authMiddleware, adminMiddleware, deleteProduct);
