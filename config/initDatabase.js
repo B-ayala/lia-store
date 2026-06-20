@@ -76,53 +76,31 @@ const initDatabase = async () => {
       console.log(`✓ Política RLS ya existe: ${policies.rows.map(p => p.policyname).join(', ')}`);
     }
 
-    // Verificar función de trigger
-    console.log('\n⚙️ Verificando función y trigger...');
-    const functionExists = await client.query(`
-      SELECT EXISTS (
-        SELECT 1 FROM pg_proc 
-        WHERE proname = 'handle_new_user'
-      );
+    // Función + trigger: crean el perfil al INSERTAR en auth.users (no al confirmar
+    // el email), así el perfil existe aunque "Confirm email" esté desactivado.
+    // Se aplican siempre (idempotente) para evitar drift entre repo y base.
+    console.log('\n⚙️ Aplicando función y trigger handle_new_user...');
+    await client.query(`
+      CREATE OR REPLACE FUNCTION public.handle_new_user()
+      RETURNS trigger AS $$
+      BEGIN
+        INSERT INTO public.profiles (id, name, role)
+        VALUES (NEW.id, NULLIF(NEW.raw_user_meta_data->>'name', ''), 'user')
+        ON CONFLICT (id) DO NOTHING;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql SECURITY DEFINER;
     `);
+    console.log('✓ Función handle_new_user aplicada');
 
-    if (!functionExists.rows[0].exists) {
-      console.log('📋 Creando función handle_new_user...');
-      await client.query(`
-        CREATE OR REPLACE FUNCTION public.handle_new_user()
-        RETURNS trigger AS $$
-        BEGIN
-          INSERT INTO public.profiles (id, role)
-          VALUES (NEW.id, 'user');
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql SECURITY DEFINER;
-      `);
-      console.log('✓ Función handle_new_user creada');
-    } else {
-      console.log('✓ Función handle_new_user ya existe');
-    }
-
-    // Verificar trigger
-    const triggerExists = await client.query(`
-      SELECT EXISTS (
-        SELECT 1 FROM pg_trigger 
-        WHERE tgname = 'on_auth_user_created'
-      );
+    await client.query('DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users');
+    await client.query(`
+      CREATE TRIGGER on_auth_user_created
+      AFTER INSERT ON auth.users
+      FOR EACH ROW
+      EXECUTE FUNCTION public.handle_new_user();
     `);
-
-    if (!triggerExists.rows[0].exists) {
-      console.log('📋 Creando trigger on_auth_user_created...');
-      await client.query(`
-        DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-        CREATE TRIGGER on_auth_user_created
-        AFTER INSERT ON auth.users
-        FOR EACH ROW
-        EXECUTE FUNCTION public.handle_new_user();
-      `);
-      console.log('✓ Trigger on_auth_user_created creado');
-    } else {
-      console.log('✓ Trigger on_auth_user_created ya existe');
-    }
+    console.log('✓ Trigger on_auth_user_created aplicado');
 
     // Crear índices para mejor rendimiento
     console.log('\n📊 Verificando índices...');

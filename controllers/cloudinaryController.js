@@ -146,6 +146,14 @@ const getImages = async (req, res) => {
       response.on('end', () => {
         try {
           const result = JSON.parse(data);
+          // Cloudinary responde 200 con { error } ante credenciales/permisos inválidos:
+          // propagarlo como error real para que el front muestre estado de error y no crashee.
+          if (result.error || !Array.isArray(result.resources)) {
+            return res.status(502).json({
+              success: false,
+              message: result.error?.message || 'Respuesta inválida de Cloudinary',
+            });
+          }
           res.json({ success: true, data: result });
         } catch (parseError) {
           console.error('Parse error:', parseError);
@@ -162,6 +170,35 @@ const getImages = async (req, res) => {
     request.end();
   } catch (error) {
     console.error('getImages handler error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Map Cloudinary Admin API /usage response to the shape the frontend expects.
+// El plan free se mide en CRÉDITOS mensuales (credits.usage/limit), no en cantidad
+// de archivos. asset_count es solo informativo (cantidad de recursos almacenados).
+const mapUsageResponse = (result) => ({
+  credits_used: result.credits?.usage ?? 0,
+  credits_limit: result.credits?.limit ?? 0,
+  credits_used_percent: result.credits?.used_percent ?? 0,
+  asset_count: result.resources ?? result.objects?.usage ?? 0,
+});
+
+const getUsage = async (_req, res) => {
+  try {
+    const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/usage`;
+    const result = await cloudinaryRequest('GET', apiPath, null);
+
+    if (result.error) {
+      return res.status(502).json({
+        success: false,
+        message: result.error.message || 'Cloudinary devolvió un error de uso',
+      });
+    }
+
+    res.json({ success: true, data: mapUsageResponse(result) });
+  } catch (error) {
+    console.error('getUsage error:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -255,4 +292,4 @@ const getConfig = (_req, res) => {
   });
 };
 
-module.exports = { generateSignature, deleteImage, getImages, getConfig, getFolders, createFolder, deleteFolder };
+module.exports = { generateSignature, deleteImage, getImages, getUsage, getConfig, getFolders, createFolder, deleteFolder };

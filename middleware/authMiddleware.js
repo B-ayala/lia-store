@@ -5,75 +5,101 @@
  * router.get('/protected', authMiddleware, controllerFunction)
  */
 
+const https = require('https');
 const { pool } = require('../config/database');
-const jwt = require('jsonwebtoken');
+
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+
+/**
+ * Verifica el access token contra Supabase Auth (GET /auth/v1/user).
+ * Supabase valida firma, expiración y revocación, y devuelve el usuario.
+ * @returns {Promise<{id: string}|null>} usuario verificado, o null si el token no es válido.
+ */
+const verifySupabaseToken = (token) =>
+  new Promise((resolve, reject) => {
+    const { hostname, pathname } = new URL(`${SUPABASE_URL}/auth/v1/user`);
+    const request = https.request(
+      {
+        hostname,
+        path: pathname,
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}`, apikey: SUPABASE_ANON_KEY },
+      },
+      (response) => {
+        let data = '';
+        response.on('data', (chunk) => { data += chunk; });
+        response.on('end', () => {
+          if (response.statusCode !== 200) return resolve(null);
+          try {
+            const user = JSON.parse(data);
+            resolve(user && user.id ? user : null);
+          } catch {
+            resolve(null);
+          }
+        });
+      }
+    );
+    request.on('error', reject);
+    request.end();
+  });
 
 const authMiddleware = async (req, res, next) => {
   try {
-    // Obtener el token del header Authorization
-    const authHeader = req.headers.authorization;
-    console.log('[AUTH DEBUG] Authorization header:', authHeader ? 'presente' : 'NO presente');
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      console.error('authMiddleware: faltan SUPABASE_URL / SUPABASE_ANON_KEY en el entorno');
+      return res.status(503).json({
+        success: false,
+        message: 'Servicio de autenticación no disponible',
+      });
+    }
 
+    const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      console.log('[AUTH DEBUG] Error: Token no proporcionado correctamente');
       return res.status(401).json({
         success: false,
-        message: 'Token de autenticación requerido'
+        message: 'Token de autenticación requerido',
       });
     }
 
     const token = authHeader.substring(7);
-    console.log('[AUTH DEBUG] Token recibido, primeros 20 caracteres:', token.substring(0, 20));
 
-    // Decodificar token para obtener user_id (sin verificar firma, solo decodificar)
-    const decoded = jwt.decode(token);
-    console.log('[AUTH DEBUG] Token decodificado, sub:', decoded?.sub);
-
-    if (!decoded || !decoded.sub) {
-      console.log('[AUTH DEBUG] Error: Token inválido o sin sub');
+    const supabaseUser = await verifySupabaseToken(token);
+    if (!supabaseUser) {
       return res.status(401).json({
         success: false,
-        message: 'Token inválido'
+        message: 'Token inválido o expirado',
       });
     }
 
-    const userId = decoded.sub;
-    console.log('[AUTH DEBUG] User ID extraído del token:', userId);
-
-    // Obtener rol del usuario desde la tabla profiles usando el ID del token
-    console.log('[AUTH DEBUG] Buscando perfil en base de datos...');
+    // El rol se lee de la tabla profiles usando el ID ya verificado por Supabase.
     const result = await pool.query(
       'SELECT id, role, name FROM public.profiles WHERE id = $1',
-      [userId]
+      [supabaseUser.id]
     );
 
     if (result.rows.length === 0) {
-      console.log('[AUTH DEBUG] Error: Perfil no encontrado para user ID:', userId);
       return res.status(401).json({
         success: false,
-        message: 'Usuario no encontrado en la base de datos'
+        message: 'Usuario no encontrado en la base de datos',
       });
     }
 
     const profile = result.rows[0];
-    console.log('[AUTH DEBUG] ✓ Perfil encontrado - ID:', profile.id, 'Rol:', profile.role);
-
-    // Guardar usuario y rol en request para uso en próximos middlewares
     req.user = {
-      id: userId,
+      id: profile.id,
       name: profile.name,
-      role: profile.role || 'user'
+      email: supabaseUser.email || null,
+      role: profile.role || 'user',
     };
     req.token = token;
 
-    console.log('[AUTH DEBUG] ✓ Autenticación exitosa para usuario:', userId);
     next();
   } catch (error) {
-    console.error('[AUTH DEBUG] Error en middleware:', error.message);
+    console.error('authMiddleware: error al validar autenticación:', error.message);
     return res.status(401).json({
       success: false,
-      message: 'Token inválido',
-      error: error.message
+      message: 'No se pudo validar la autenticación',
     });
   }
 };

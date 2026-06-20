@@ -4,8 +4,8 @@ const { getStatus, recordRateLimit } = require('../middleware/signupTracker');
 /**
  * @desc    Login de usuario
  * @route   POST /api/users/login
- * @note    Con Supabase Auth, el login debe manejarse en el frontend o a través de Supabase
- *          Este endpoint es para validar credenciales contra Supabase
+ * @note    Valida las credenciales contra Supabase Auth (grant_type=password);
+ *          nunca devuelve éxito sin verificar la contraseña.
  */
 exports.loginUser = async (req, res) => {
   try {
@@ -18,6 +18,29 @@ exports.loginUser = async (req, res) => {
       });
     }
 
+    const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+    const anonKey = process.env.SUPABASE_ANON_KEY || '';
+
+    if (!supabaseUrl || !anonKey) {
+      return res.status(503).json({
+        success: false,
+        message: 'Servicio de autenticación no disponible'
+      });
+    }
+
+    const authResponse = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: anonKey },
+      body: JSON.stringify({ email, password })
+    });
+
+    if (!authResponse.ok) {
+      return res.status(401).json({
+        success: false,
+        message: 'Credenciales inválidas'
+      });
+    }
+
     const user = await User.findByEmail(email);
 
     if (!user) {
@@ -27,16 +50,11 @@ exports.loginUser = async (req, res) => {
       });
     }
 
-    // Nota: Supabase maneja la autenticación, pero si necesitas validar
-    // contraseña contra hash en PostgreSQL:
-    // const isPasswordValid = User.comparePassword(password, user.password_hash);
-    // if (!isPasswordValid) { ... }
-
     res.status(200).json({
       success: true,
       data: {
         id: user.id,
-        user_id: user.user_id,
+        user_id: user.id,
         name: user.name,
         email: user.email,
         role: user.role
@@ -46,7 +64,7 @@ exports.loginUser = async (req, res) => {
     console.error('Error en loginUser:', error);
     res.status(500).json({
       success: false,
-      message: error.message
+      message: 'No se pudo validar las credenciales'
     });
   }
 };

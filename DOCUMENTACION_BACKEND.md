@@ -1,0 +1,321 @@
+# Documentación Técnica — Backend (lia-store / "lia-ecommerce")
+
+> Documentación de **cómo está construido hoy** el backend, leída directamente del código fuente
+> (`server.js`, `routes/`, `controllers/`, `models/`, `middleware/`, `config/`). Pensada como
+> referencia de consulta antes de cualquier cambio.
+>
+> ⚠️ **Leé primero la sección 11 (Discrepancias con el frontend).** Este backend implementa un
+> contrato **distinto** al que consume el frontend actual (`../../FRONT/damiana-bella`). No asumas
+> que todo lo que el front llama existe acá.
+
+---
+
+## 1. Resumen
+
+API REST en **Node.js + Express** con patrón **MVC**, sobre **PostgreSQL/Supabase** (acceso
+directo vía `pg`, no vía el SDK de Supabase). Expone tres áreas bajo el prefijo `/api`:
+
+- **`/api/users`** — perfiles de usuario (sobre `public.profiles` + `auth.users`), login de
+  referencia y tracker de rate-limit de signup.
+- **`/api/products`** — CRUD de productos (lectura pública, escritura solo admin).
+- **`/api/cloudinary`** — firma de uploads y gestión de imágenes/carpetas vía Admin API de Cloudinary.
+
+La autenticación se basa en el **JWT de Supabase Auth** que emite el frontend: el backend lo
+**decodifica** para extraer el `sub` (user id) y busca el rol en `public.profiles`.
+
+---
+
+## 2. Tecnologías y dependencias
+
+| Dependencia | Versión | Uso |
+|---|---|---|
+| `express` | ^4.18.2 | servidor HTTP / routing |
+| `pg` | ^8.11.3 | cliente PostgreSQL (pool) |
+| `jsonwebtoken` | ^9.0.3 | **decodificar** el JWT de Supabase (no se verifica firma — ver §10) |
+| `bcryptjs` | ^2.4.3 | hashing de passwords (declarado; sin uso activo en el código actual) |
+| `cors` | ^2.8.5 | CORS con allowlist por `FRONTEND_URL` |
+| `dotenv` | ^16.6.1 | variables de entorno |
+| `nodemon` | ^3.0.1 (dev) | hot-reload en desarrollo |
+
+- `package.json` → `name: lia-ecommerce`, `main: server.js`, `engines.node: >=14`.
+- Scripts: `start` (`node server.js`), `dev` (`nodemon server.js`), `init-db` (`node config/initDatabase.js`).
+
+---
+
+## 3. Estructura de carpetas
+
+```
+lia-store/
+├── server.js                  # Entry point: Express, CORS, montaje de rutas, error handler, arranque tras connectDB
+├── package.json               # deps + scripts (start / dev / init-db)
+├── .env.example               # plantilla de variables de entorno  ⚠️ (ver §10: contiene credenciales reales)
+├── .gitignore
+│
+├── config/
+│   ├── database.js            # Pool de pg (SSL), connectDB() con reintentos, verificación de tabla profiles
+│   ├── initDatabase.js        # `npm run init-db`: crea/verifica profiles, RLS, trigger handle_new_user, carousel_images, columnas de productos
+│   └── migrateData.js         # script legacy de migración MongoDB → PostgreSQL (referencia, opcional)
+│
+├── routes/                    # Definición de endpoints (Express Router)
+│   ├── userRoutes.js          # /api/users
+│   ├── productRoutes.js       # /api/products  (con auth+admin en escritura)
+│   └── cloudinaryRoutes.js    # /api/cloudinary
+│
+├── controllers/               # Lógica de cada endpoint
+│   ├── userController.js       # login, CRUD de perfiles, signup status/ratelimit, getUserByAuthId
+│   ├── productController.js    # CRUD de productos con SQL parametrizado + borrado de imagen en Cloudinary
+│   └── cloudinaryController.js # firma SHA1, delete, getImages, getConfig, folders (get/create/delete)
+│
+├── models/
+│   └── User.js                # Capa de datos de profiles (findById, findAll, findByIdAndUpdate, findByIdAndDelete)
+│
+├── middleware/
+│   ├── authMiddleware.js       # authMiddleware (decodifica JWT + busca rol en profiles) + adminMiddleware
+│   └── signupTracker.js        # rate-limit de signup in-memory (Map por email)
+│
+└── docs/
+    └── SUPABASE_AUTH.md        # notas sobre el modelo de auth con Supabase
+```
+
+> El repo trae además documentación propia: `README.md`, `ARCHITECTURE.md`, `QUICKSTART.md`,
+> `CHANGELOG.md`, `VERIFICATION_CHECKLIST.md`. Este documento las complementa con una vista
+> verificada contra el código actual.
+
+---
+
+## 4. Arquitectura (MVC por capas)
+
+```
+HTTP request
+   │
+   ▼
+routes/*           → define método + path, aplica middlewares
+   │
+   ▼
+middleware/*       → authMiddleware (JWT→user_id→rol) + adminMiddleware (rol === 'admin')
+   │
+   ▼
+controllers/*      → validación de input, orquestación, forma de la respuesta { success, data, ... }
+   │
+   ▼
+models/User.js  ó  pool.query(...)   → acceso a PostgreSQL/Supabase
+   │
+   ▼
+config/database.js → Pool de conexiones pg
+```
+
+- **Separación de capas**: routes → controllers → (models | pool). Los controllers no definen
+  rutas; los models encapsulan SQL de `profiles`. **Excepción**: `productController` y
+  `cloudinaryController` ejecutan `pool.query` / llamadas HTTP directamente (no usan una capa
+  model dedicada).
+- **Respuesta consistente**: todas las respuestas siguen `{ success: boolean, ... }`
+  (`data`, `message`, `count/total/limit/offset` en listados).
+- **Arranque ordenado** (`server.js`): primero `connectDB()` (con reintentos), recién entonces
+  `app.listen`. Si la BD no conecta, el proceso sale con código 1.
+
+---
+
+## 5. Endpoints
+
+### 5.1 Usuarios — `/api/users` (`userRoutes.js` → `userController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/users/signup-status/:email` | pública | Estado de rate-limit de signup (solo lectura). |
+| POST | `/api/users/signup-ratelimit` | pública | Registra que Supabase devolvió rate-limit para un email. Body `{ email }`. |
+| POST | `/api/users/login` | pública | Login "de referencia": busca por email en `profiles`/`auth.users`. **No valida password** (ver §10/§11). |
+| GET | `/api/users/auth/:userId` | pública | Usuario por Supabase Auth ID. |
+| GET | `/api/users` | pública | Lista de perfiles (paginada `?limit&offset`, máx 100). |
+| POST | `/api/users` | pública | Legacy/obsoleto: devuelve nota de "crear vía Supabase Auth". |
+| GET | `/api/users/:id` | pública | Perfil por id. |
+| PUT | `/api/users/:id` | pública | Actualiza `name`/`role` (transacción, valida rol ∈ {user,admin}). |
+| DELETE | `/api/users/:id` | pública | Borra de `profiles` **y** `auth.users` (transacción). |
+
+> ⚠️ Estas rutas de usuarios **no tienen `authMiddleware`**: hoy son públicas (cualquiera puede
+> listar, editar rol o borrar usuarios). Ver §10.
+
+### 5.2 Productos — `/api/products` (`productRoutes.js` → `productController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/products` | pública | Lista paginada (`?limit&offset`, máx 100), `ORDER BY created_at DESC`. |
+| GET | `/api/products/:id` | pública | Producto por id. |
+| POST | `/api/products` | **Bearer + admin** | Crea producto. Requiere `name` y `price`. |
+| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes). |
+| DELETE | `/api/products/:id` | **Bearer + admin** | Borra producto y su imagen en Cloudinary (best-effort). |
+
+Body de create/update (camelCase → columnas snake_case): `name`, `price`, `stock`, `category`,
+`imageUrl`/`images[]` (se sincroniza `image_url` con la primera), `publicId`, `description`,
+`discount` (admite null), `condition` (`new`/`used`), `freeShipping`, `variants`,
+`specifications`, `features`, `faqs` (JSONB), `warranty`, `returnPolicy`, `status`.
+
+### 5.3 Cloudinary — `/api/cloudinary` (`cloudinaryRoutes.js` → `cloudinaryController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/cloudinary/config` | pública | `{ cloudName, apiKey }`. |
+| GET | `/api/cloudinary/images` | pública | Lista recursos (`?folder&next_cursor`, Admin API). |
+| GET | `/api/cloudinary/folders` | pública | Lista carpetas (`?path`). |
+| POST | `/api/cloudinary/folders` | pública | Crea carpeta. Body `{ path }`. |
+| DELETE | `/api/cloudinary/folders` | pública | Borra carpeta. Body `{ path }`. |
+| POST | `/api/cloudinary/sign` | pública | Firma SHA1 de los params recibidos + `CLOUDINARY_API_SECRET`. |
+| POST | `/api/cloudinary/delete` | pública | Borra imagen. Body `{ publicId }`. |
+
+### 5.4 Utilidades
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/` | Info de la API (`{ message, version }`). |
+| GET | `/health` | Health check (`{ status: 'OK' }`). |
+| (cualquiera) | `*` | 404 `{ success:false, message:'Ruta no encontrada' }`. |
+
+---
+
+## 6. Autenticación y autorización
+
+- **Origen del token**: el frontend obtiene el JWT de **Supabase Auth** y lo manda en
+  `Authorization: Bearer <token>`.
+- **`authMiddleware`**: hace `jwt.decode(token)` (**sin verificar firma**), toma `decoded.sub`
+  como user id, y consulta `SELECT id, role, name FROM public.profiles WHERE id = $1`. Si existe,
+  setea `req.user = { id, name, role }`.
+- **`adminMiddleware`**: debe ir después de `authMiddleware`; exige `req.user.role === 'admin'`
+  (403 si no).
+- Hoy **solo `/api/products` (POST/PUT/DELETE)** usa esta cadena. El resto de mutaciones
+  (usuarios) están sin protección.
+
+---
+
+## 7. Modelo de datos (PostgreSQL / Supabase)
+
+Acceso directo con `pg` al Postgres de Supabase (esquemas `public` y `auth`).
+
+| Tabla | Esquema | Uso en el backend |
+|---|---|---|
+| `profiles` | public | `id UUID` (FK → `auth.users.id`, ON DELETE CASCADE), `name`, `role` (`user`/`admin`), `created_at`. RLS habilitada; política "Users see their profile". Índice `idx_profiles_role`. |
+| `auth.users` | auth | gestionada por Supabase Auth; se lee (`email`, `email_confirmed_at`) y se borra en cascada al eliminar perfil. |
+| `productos` | public | CRUD vía `productController`. Columnas (incluidas por `init-db`): `name`, `price`, `stock`, `category`, `image_url`, `public_id`, `description`, `discount NUMERIC(5,2)`, `condition`, `free_shipping`, `variants/specifications/features/faqs/images JSONB`, `warranty`, `return_policy`, `status`, `featured`, `created_at`, `updated_at`. |
+| `carousel_images` | public | creada por `init-db` (`id`, `url`, `order`, `is_active`, `created_at`). La escribe el frontend directo; el backend solo la crea. |
+
+**Trigger** (`init-db`): `on_auth_user_created` → `handle_new_user()` inserta una fila en
+`profiles` (rol `user`) cada vez que se crea un usuario en `auth.users`.
+
+> El esquema "fuente de verdad" lo administra Supabase; `init-db` es idempotente
+> (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`) y sirve para alinear una BD nueva.
+
+---
+
+## 8. Configuración (variables de entorno)
+
+Definidas en `.env` (plantilla en `.env.example`). El backend usa **conexión directa a Postgres**
+(`DB_*`), no `SUPABASE_URL`/`SUPABASE_KEY`.
+
+| Variable | Requerida | Uso |
+|---|---|---|
+| `NODE_ENV` | — | `development`/`production` (controla verbosidad de errores). |
+| `PORT` | — | Puerto HTTP (default `3000`). |
+| `DB_HOST` | ✅ | Host de Postgres/Supabase. |
+| `DB_PORT` | ✅ | Puerto (típicamente `5432`). |
+| `DB_USER` | ✅ | Usuario (`postgres`). |
+| `DB_PASSWORD` | ✅ | **Secreto.** Password de la BD. |
+| `DB_NAME` | ✅ | Base (`postgres`). |
+| `FRONTEND_URL` | ✅ (recomendada) | Allowlist de CORS (coma-separada). Default `http://localhost:5173`. |
+| `CLOUDINARY_CLOUD_NAME` | ✅ (Cloudinary) | Cloud name. **Falta en `.env.example`.** |
+| `CLOUDINARY_API_KEY` | ✅ (Cloudinary) | API key. **Falta en `.env.example`.** |
+| `CLOUDINARY_API_SECRET` | ✅ (Cloudinary) | **Secreto.** Para firmar/borrar. **Falta en `.env.example`.** |
+
+> El pool de `pg` usa `ssl: { rejectUnauthorized: false }`.
+
+---
+
+## 9. Cómo levantar el proyecto
+
+```bash
+# Requisitos: Node >= 14 (el frontend usa 22.x; alinear a la versión del front es lo más seguro)
+
+# 1. Instalar dependencias
+npm install
+
+# 2. Crear .env (a partir de .env.example) con DB_*, FRONTEND_URL y CLOUDINARY_*
+#    ⚠️ NO reutilizar las credenciales del .env.example (ver §10) — rotalas.
+
+# 3. (Opcional) Inicializar/alinear el esquema en una BD nueva
+npm run init-db
+
+# 4. Levantar
+npm run dev      # nodemon (desarrollo)
+npm start        # node server.js (producción)
+
+# Verificación rápida
+#   GET http://localhost:3000/health  → { "status": "OK" }
+```
+
+El frontend que apunta a esta API está en `../../FRONT/damiana-bella` y se configura con
+`VITE_API_URL_LOCAL=http://localhost:3000/api`. **Antes de integrarlos, leé la §11.**
+
+---
+
+## 10. Riesgos de seguridad detectados (a revisar)
+
+> Hallazgos verificados en el código actual. No los corregí (la tarea era documentar), pero
+> conviene tratarlos antes de producción. Referencia: `../../skill/04-security.md`.
+
+1. **JWT sin verificación de firma** (`authMiddleware.js`): usa `jwt.decode`, no `jwt.verify`.
+   Cualquiera puede forjar un token con un `sub` arbitrario; si ese `sub` existe en `profiles`
+   con rol `admin`, obtiene acceso admin. **Debe verificarse la firma** contra el JWKS/secret de
+   Supabase.
+2. **Rutas de usuarios sin auth**: `GET/PUT/DELETE /api/users(/:id)` son públicas → listar
+   usuarios, **cambiar roles** (escalada de privilegios) y borrar cuentas sin autenticación.
+3. **Credenciales reales en `.env.example`**: incluye `DB_HOST` real y `DB_PASSWORD` en claro.
+   Si el repo es/llega a ser público, la BD queda expuesta. **Rotar la password** y dejar la
+   plantilla con valores vacíos/placeholder.
+4. **`CLOUDINARY_*` ausentes en `.env.example`**: el código las usa pero no están documentadas
+   en la plantilla → arranque/firmas fallan silenciosamente.
+5. **Logging sensible**: `authMiddleware` y `cloudinaryController` hacen `console.log` de tokens
+   (parciales) y firmas. Quitar en producción.
+6. **`login` no valida password**: `POST /api/users/login` devuelve datos del usuario solo con
+   el email (la comparación de hash está comentada). No usar como mecanismo de autenticación.
+
+---
+
+## 11. Discrepancias con el frontend actual (importante)
+
+El frontend en `../../FRONT/damiana-bella` migró a un **esquema de auth con JWT propio** y usa
+endpoints que **este backend no implementa**. Es decir, **este backend corresponde a una versión
+anterior** (auth basada en el token de Supabase). Lo que el front llama y acá **falta**:
+
+- **Auth propia (`/api/auth/*`)**: `register`, `login`, `logout`, `me`, `refresh`,
+  `confirm-email`, `resend-confirmation`, `forgot-password`, `reset-password`, `change-password`.
+  Acá la auth vive en `/api/users` con otro contrato.
+- **Órdenes/pagos (`/api/orders/*`)**: `mp-preference` (Mercado Pago), `user?email=`,
+  `:id/cancel`, `:id/confirm-transfer`, `:id/cancel-transfer`. **No existen.**
+- **Envíos (`/api/shipping`)**: cálculo por código postal. **No existe.**
+- **`/api/cloudinary/usage`**: el front lo consume; acá no está implementado (sí están
+  `config`, `images`, `folders`, `sign`, `delete`).
+
+Además, en el código actual hay **referencias rotas**: `userController.loginUser` llama a
+`User.findByEmail` y `getUserByAuthId` llama a `User.findByUserId`, pero **esos métodos no
+existen** en `models/User.js` (solo `findById`, `findAll`, `findByIdAndUpdate`,
+`findByIdAndDelete`). Esas rutas lanzarían error en runtime.
+
+> **Conclusión:** para que este backend sirva al frontend actual hay que **alinear contratos**
+> (implementar auth JWT, orders, shipping, cloudinary/usage y proteger las rutas de usuarios), o
+> bien reemplazar este backend por el que el frontend espera. Esto **excede** la tarea de
+> documentar: queda señalado como decisión pendiente.
+
+---
+
+## 12. Patrones y buenas prácticas detectadas
+
+- **SQL parametrizado** en todos los `pool.query` (productos, usuarios) → mitiga inyección SQL.
+- **Transacciones** (`BEGIN/COMMIT/ROLLBACK`) en update/delete de usuarios.
+- **Pool de conexiones** configurado (max 20, timeouts) y `connectDB` con reintentos + diagnóstico.
+- **Update dinámico** de productos (solo persiste campos presentes en el body).
+- **Respuesta uniforme** `{ success, ... }` y paginación con `limit/offset` (máx 100).
+- **CORS con allowlist** por `FRONTEND_URL` (no `*`).
+- **Errores genéricos al cliente en producción** (`NODE_ENV`), detalle solo en dev.
+- **`init-db` idempotente** para alinear esquema sin romper datos existentes.
+
+---
+
+## 13. Skills senior
+
+El contrato de calidad senior se carga automáticamente vía [CLAUDE.md](CLAUDE.md), que importa
+los skills compartidos desde `../../skill/`. Para backend aplican principalmente: `00-role`,
+`01-backend`, `03-testing-qa`, `04-security`, `06-restrictions`, `07-senior-rules`,
+`08-delivery-format`, `09-protocols`, `10-documentation`, más `11-bug-hunter` y `12-judge-architect`.

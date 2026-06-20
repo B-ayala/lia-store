@@ -1,35 +1,33 @@
 const express = require('express');
 const router = express.Router();
 const {
+  loginUser,
   getUsers,
   getUserById,
   createUser,
   updateUser,
   deleteUser,
-  loginUser,
   getUserByAuthId,
   signupStatus,
   signupRateLimit
 } = require('../controllers/userController');
+const { authMiddleware, adminMiddleware } = require('../middleware/authMiddleware');
 
-// Signup rate limit tracker
+// ─── Públicas (flujo de signup/login, pre-auth) ───
+router.post('/login', loginUser);
 router.get('/signup-status/:email', signupStatus);
 router.post('/signup-ratelimit', signupRateLimit);
 
-// Ruta de login
-router.post('/login', loginUser);
+// ─── Protegidas (admin) ───
+router.get('/auth/:userId', authMiddleware, adminMiddleware, getUserByAuthId);
 
-// Ruta para obtener usuario por Supabase Auth ID
-router.get('/auth/:userId', getUserByAuthId);
-
-// Rutas CRUD principales
 router.route('/')
-  .get(getUsers)
-  .post(createUser);
+  .get(authMiddleware, adminMiddleware, getUsers)
+  .post(authMiddleware, adminMiddleware, createUser);
 
 router.route('/:id')
-  .get(getUserById)
-  .put(updateUser)
-  .delete(deleteUser);
+  .get(authMiddleware, adminMiddleware, getUserById)
+  .put(authMiddleware, adminMiddleware, updateUser)
+  .delete(authMiddleware, adminMiddleware, deleteUser);
 
 module.exports = router;
