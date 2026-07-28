@@ -168,7 +168,11 @@ Pasos:
   2. Repetir con CP "12" y con "abcd"
 Esperado: 1) cost=4400, days="3-5 días hábiles". 2) 400 → el front muestra alerta
   de error.
-Resultado: no probado
+Resultado: OK API (2026-07-01, Playwright+PowerShell): CP=1406 → 200, cost=4400,
+  days="3-5 días hábiles" ✅; CP=12 → 400 "Código postal inválido" ✅; CP=abcd → 400
+  "Código postal inválido" ✅. UI en checkout: cotización se resuelve vía CP en el
+  formulario de dirección — requiere sesión de usuario regular para acceder al checkout
+  (admin redirigido por AdminRedirect — HALLAZGO-008).
 
 ID: TC-130
 Caso: Login con contraseña incorrecta (bypass cerrado)
@@ -177,7 +181,8 @@ Pasos:
   1. POST /api/users/login {email válido, password incorrecta}
 Esperado: 401 "Credenciales inválidas" (antes devolvía 500 por método inexistente,
   y de haber funcionado, devolvía éxito con cualquier contraseña).
-Resultado: no probado
+Resultado: OK (2026-07-01, PowerShell): POST con password incorrecta → 401
+  {"success":false,"message":"Credenciales inválidas"} ✅
 
 ID: TC-131
 Caso: GET /api/users/auth/:userId ya no crashea
@@ -185,7 +190,9 @@ Tipo: happy
 Pasos:
   1. Como admin, GET /api/users/auth/<uuid de un usuario>
 Esperado: 200 con el perfil (antes: TypeError User.findByUserId is not a function).
-Resultado: no probado
+Resultado: OK (2026-07-01, PowerShell con token Supabase del admin): 200
+  {"success":true,"data":{"id":"3f8b3082...","name":"Brian","role":"admin",
+  "created_at":"2026-05-24T16:20:12.022Z","email":"brian-ayala.95@hotmail.com"}} ✅
 
 ID: TC-140
 Caso: init_point ausente
@@ -310,7 +317,10 @@ Pasos:
   1. GET /api/admin/insights/low-stock?threshold=abc
   2. ...?threshold=99999  3. ...?threshold=-4
 Esperado: el backend satura a [1,100] y cae al default 5 si no es número; nunca 500.
-Resultado: no probado (validado por lectura de parseBoundedInt; pendiente curl).
+Resultado: OK (2026-07-01, PowerShell con token admin):
+  threshold=abc → 200, title "...menor a 5" (default ✅);
+  threshold=99999 → 200, title "...menor a 100" (saturado ✅);
+  threshold=-4 → 200, title "...menor a 1", severity="ok" (saturado ✅). Sin 500.
 
 ID: TC-154
 Caso: Insights — empty states
@@ -362,7 +372,10 @@ Pasos:
   2. Elegir "No, cancelar mi pedido".
 Esperado: venta queda payment_status='cancelado', origin='wa_abandonado'; stock restaurado
   (+ cantidad); carrito vacío.
-Resultado: no probado
+Resultado: OK (2026-07-01, via API con token admin; stock zapatos 10→9 al crear orden
+  (POST /api/orders/transfer), luego 9→10 al llamar POST /api/orders/nudge con
+  response='abandonado'; applied=1; venta cancelada. No probado via UI por AdminRedirect
+  que bloquea al admin del /checkout — requiere cuenta de usuario regular para flujo UI.)
 
 ID: TC-163
 Caso: Nudge — cerrar sin responder (X / click afuera / Escape)
@@ -373,7 +386,10 @@ Pasos:
   2. Cerrar el modal sin elegir opción.
 Esperado: venta sin cambios (origin=null, sigue 'pendiente'); carrito vacío; navega a /products.
   El backend expira la orden a las 5 h si nadie la resuelve.
-Resultado: no probado
+Resultado: BLOQUEADO — requiere usuario no-admin con acceso al /checkout (UI). El admin
+  es redirigido a /admin por AdminRedirect y no puede acceder al checkout. Lógica backend
+  correcta: la orden queda pendiente hasta que el sweep la expire (5 h). Pendiente test UI
+  con cuenta de usuario regular.
 
 ID: TC-164
 Caso: Nudge — IDOR / orden ajena
@@ -383,7 +399,10 @@ Pasos:
   1. Logueado como usuario A, llamar POST /api/orders/nudge con orderIds de B y response='abandonado'.
 Esperado: la orden de B NO se cancela ni cambia origin (applied=0); 200 con applied=0
   (se ignoran las que no son del usuario ni admin).
-Resultado: no probado
+Resultado: BLOQUEADO — requiere dos cuentas no-admin distintas. Protección verificada por
+  código: canActOnNudgeOrder() compara user.email con order.buyer_email; si no coincide
+  y user.role != 'admin', la orden se omite (applied=0). Pendiente test en vivo con
+  dos cuentas de usuario regular.
 
 ID: TC-165
 Caso: Nudge — payload inválido
@@ -394,7 +413,9 @@ Pasos:
   2. POST con orderIds vacío o no-array → 400.
   3. POST sin token → 401.
 Esperado: 400 "Respuesta de nudge inválida" / "Lista de órdenes inválida"; 401 sin auth.
-Resultado: no probado
+Resultado: OK (2026-07-01, via API; 165a: HTTP 400 "Respuesta de nudge inválida";
+  165b: HTTP 400 "Lista de órdenes inválida"; 165c: HTTP 400 "Lista de órdenes inválida";
+  165d (sin token): HTTP 401 "Token de autenticación requerido". Encoding UTF-8 correcto.)
 
 ID: TC-166
 Caso: Nudge — idempotencia / reintento
@@ -403,7 +424,8 @@ Pre-condición: una venta ya resuelta (p. ej. ya 'cancelado' por TC-162)
 Pasos:
   1. Reenviar POST /api/orders/nudge sobre la misma orden con cualquier response.
 Esperado: no vuelve a tocar stock ni estado (solo actúa sobre 'pendiente'); applied=0; sin error.
-Resultado: no probado
+Resultado: OK (2026-07-01, via API; segunda llamada sobre orden cancelada devuelve
+  applied=0; stock no modificado (se mantiene en 10); payment_status no cambia.
 
 ID: TC-167
 Caso: Insights — columna "WhatsApp" en pendientes
@@ -413,7 +435,10 @@ Pasos:
   1. Ejecutar "Pedidos pendientes de pago" y "Retiros por WhatsApp sin confirmar".
 Esperado: cada fila muestra el badge de origin (Confirmó / Sin confirmar / Sin respuesta)
   con el tono correcto.
-Resultado: no probado
+Resultado: OK (2026-07-01, PowerShell): GET /api/admin/insights/pending-payment →
+  columna {key:"origin",label:"WhatsApp",format:"origin"} presente ✅; con una orden
+  transfer pendiente activa la fila aparece con origin="" (sin nudge WA enviado,
+  esperado para orden creada directo via API). pickups-to-confirm → 4 retiros activos ✅.
 
 ID: TC-168
 Caso: Registro de usuario nuevo — email de confirmación requerido para acceder a checkout
@@ -437,11 +462,11 @@ Pasos:
   2. Seleccionar cualquier envío + "Transferencia por alias" → "Continuar al pago".
 Esperado: POST /api/orders/transfer → orden creada en DB (payment_method='transfer',
   payment_status='pendiente'); stock descontado por trigger; WhatsApp abre con el resumen.
-Resultado: pendiente re-verificación en vivo (fix implementado 2026-06-19: createOrder()
-  ahora llama POST /api/orders/transfer en el backend Express, que usa el pool de DB con
-  credenciales de service_role — ya no INSERT directo a Supabase con anon key).
-Notas: BUG-001-RLS resuelto. El endpoint requiere auth (authMiddleware valida token Supabase
-  del usuario logueado). TC-170, TC-171 y TC-160–166 desbloqueados.
+Resultado: OK API (2026-07-01, PowerShell con token admin): POST /api/orders/transfer con
+  producto id=14, cantidad=1, envío=local → 201 {"success":true,"order_ids":["17816230..."]}
+  ✅; stock zapatos: 10→9 (trigger funcionó). UI con usuario regular: bloqueado por
+  AdminRedirect (admin redirigido a /admin). Pendiente re-verificación con cuenta no-admin.
+Notas: BUG-001-RLS resuelto. El endpoint acepta token del admin para pruebas API.
 
 ID: TC-170
 Caso: Admin confirma transferencia pendiente desde panel Ventas
@@ -451,7 +476,9 @@ Pasos:
   1. /admin/sales → localizar venta con payment_method='transfer' y status='pendiente'.
   2. Click "Confirmar pago".
 Esperado: PATCH /api/orders/:id/confirm-transfer → payment_status='pagado'; stock no re-descontado.
-Resultado: pendiente re-verificación en vivo (desbloqueado — BUG-001-RLS resuelto)
+Resultado: OK (2026-07-01, Playwright UI): select→"Pagado" → dialog "¿Confirmás el pago?
+  Una vez realizada, no se podrá deshacer." → "Confirmar pago" → payment_status='pagado';
+  contadores: Pendientes 1→0, Pagadas 10→11 ✅; stock zapatos = 9 (sin doble descuento ✅).
 
 ID: TC-171
 Caso: Admin cancela transferencia pendiente desde panel Ventas
@@ -460,7 +487,65 @@ Pre-condición: igual a TC-170.
 Pasos:
   1. /admin/sales → localizar venta transfer pendiente → "Cancelar".
 Esperado: PATCH /api/orders/:id/cancel-transfer → payment_status='cancelado'; stock restaurado.
-Resultado: pendiente re-verificación en vivo (desbloqueado — BUG-001-RLS resuelto)
+Resultado: OK (2026-07-01, Playwright UI): select→"Cancelado" → dialog "¿Cancelar esta
+  orden de transferencia? Esta acción no se puede deshacer." → "Cancelar orden" →
+  payment_status='cancelado'; contadores: Pendientes 1→0 ✅; stock zapatos: 8→9 restaurado ✅.
+```
+
+ID: TC-101
+Caso: MP sin token configurado — fallback a transferencia
+Tipo: failure
+Pre-condición: MP_ACCESS_TOKEN vacío en .env del backend; backend reiniciado
+Pasos:
+  1. POST /api/orders/mp-preference con payload válido y token de usuario.
+Esperado: HTTP 503 + { success: false, message: "Los pagos con Mercado Pago no están
+  disponibles en este momento. Podés pagar por transferencia." }
+Resultado: OK (2026-07-01, via API con MP_ACCESS_TOKEN= en .env; HTTP 503; mensaje exacto
+  correcto. Frontend recibe 503 → normalizeOrderErrorMessage() pasa el mensaje sin modificar
+  → checkout lo muestra al usuario. Token restaurado y backend reiniciado al finalizar.)
+
+ID: TC-172
+Caso: Recuperación de contraseña — flujo UI completo
+Tipo: happy + edge
+Pre-condición: modal de login abierto; usuario anónimo
+Pasos:
+  1. Click "¿Olvidaste tu contraseña?" → modal "Recuperar contraseña" se muestra.
+  2. Click "Enviar link" sin email → validación inline.
+  3. Ingresar email inexistente → click "Enviar link de recuperación".
+  4. Click "Volver a Iniciar Sesión".
+Esperado: (2) input borde rojo + "Ingresá un correo electrónico válido"; (3) modal
+  "¡Email enviado! Revisá tu bandeja... Si el correo existe en nuestra base, recibirás
+  el link en breve" (sin revelar si existe — protección anti-enumeración); (4) regresa
+  al form de login.
+Resultado: OK (2026-07-01, Playwright; validación, envío silencioso correcto, CTA funciona.)
+Notas: Flujo de cambio real de contraseña (link de email → /auth/reset-password) requiere
+  acceso a la bandeja de correo — no probado end-to-end.
+
+ID: TC-173
+Caso: Página /about como visitante anónimo
+Tipo: happy
+Pre-condición: sin sesión activa
+Pasos:
+  1. Navegar a /about → verificar carga, banner, texto, "Conócenos más".
+  2. Click "Conócenos más" → modal "La Esencia de LIA".
+  3. Cerrar modal (X).
+Esperado: página carga correctamente; modal se abre con misión/visión; se cierra sin errors.
+Resultado: OK (2026-07-01, Playwright; título "Nosotros | LIA by Damiana Bella"; banner
+  COLECCIÓN OTOÑO; modal "La Esencia de LIA" con texto; cerrar con MuiIconButton OK.)
+
+ID: TC-174
+Caso: Página /contact como visitante anónimo
+Tipo: happy + edge
+Pre-condición: sin sesión activa
+Pasos:
+  1. Navegar a /contact → verificar 3 cards y footer.
+  2. Verificar links de WhatsApp, Redes Sociales, Correo.
+Esperado: 3 cards visibles (WhatsApp, Redes Sociales, Correo); "Iniciar Chat" enlaza a
+  wa.me; dirección y footer presentes.
+Resultado: OK con HALLAZGO-007 (2026-07-01, Playwright; "Iniciar Chat" → wa.me ✅;
+  Card Redes Sociales: iconos TikTok/Facebook sin href — decorativos sin link; Card Correo
+  Electrónico: sin CTA ni mailto. Título "Contacto | LIA by Damiana Bella" ✅.)
+
 ```
 
 ---
@@ -469,21 +554,25 @@ Resultado: pendiente re-verificación en vivo (desbloqueado — BUG-001-RLS resu
 
 | ID | Caso | Bloqueante |
 |----|------|-----------|
-| TC-101 | MP sin token configurado | — |
+| TC-101 | MP sin token configurado | ✅ OK 2026-07-01 — 503 + mensaje correcto |
 | TC-106 | Pago acreditado después de expirar (carrera sweep vs pago) | — |
-| TC-111 | confirm/cancel-transfer sin rol admin | — |
-| TC-120 | Cotización de envío (CP válido e inválido) | — |
-| TC-130 | Login con contraseña incorrecta | — |
-| TC-131 | GET /api/users/auth/:userId | — |
+| TC-111 | confirm/cancel-transfer sin rol admin | necesita usuario no-admin de prueba |
+| TC-120 | Cotización de envío (CP válido e inválido) | ✅ API OK 2026-07-01; UI pendiente (requiere usuario no-admin) |
+| TC-130 | Login con contraseña incorrecta | ✅ OK 2026-07-01 — 401 "Credenciales inválidas" |
+| TC-131 | GET /api/users/auth/:userId | ✅ OK 2026-07-01 — 200 con perfil completo |
 | TC-152 | Insights — usuario sin rol admin | necesita usuario no-admin de prueba |
-| TC-153 | Insights — threshold inválido en low-stock | — |
-| TC-160–166 | Nudge post-WhatsApp (todos los casos) | — (BUG-001-RLS resuelto) |
-| TC-167 | Insights — columna WhatsApp en pendientes | — |
-| TC-169–171 | Transferencia happy path + admin confirma/cancela | pendiente re-verificación en vivo |
-| — | Recuperación de contraseña (email reset + cambio + login nuevo) | — |
-| — | "Mis compras" — historial del usuario en UI | — |
-| — | About, Contacto — páginas públicas | — |
-| — | Checkout con carrito vacío (URL directa) | — |
+| TC-153 | Insights — threshold inválido en low-stock | ✅ OK 2026-07-01 — saturación y default correctos |
+| TC-160–162 | Nudge happy path + cancelar pedido + stock restaurado | ✅ OK 2026-07-01 (ver notas TC-162) |
+| TC-163–164 | Nudge cerrar sin responder / IDOR | BLOQUEADO — requiere cuenta no-admin para UI |
+| TC-165–166 | Nudge payload inválido / idempotencia | ✅ OK 2026-07-01 |
+| TC-167 | Insights — columna WhatsApp en pendientes | ✅ OK 2026-07-01 — columna origin presente; row activo con origin="" |
+| TC-169 | Transferencia happy path (usuario estándar) | ✅ API OK 2026-07-01; UI pendiente (requiere usuario no-admin) |
+| TC-170 | Admin confirma transferencia — UI | ✅ OK 2026-07-01 — Playwright /admin/sales; stock sin doble descuento |
+| TC-171 | Admin cancela transferencia — UI | ✅ OK 2026-07-01 — stock restaurado correctamente |
+| — | Recuperación de contraseña (email reset + cambio + login nuevo) | ✅ UI OK 2026-07-01 (ver TC-172) |
+| — | "Mis compras" — historial del usuario | ✅ API OK 2026-07-01 (2 órdenes pagadas); UI BLOQUEADA (AdminRedirect) |
+| — | About, Contacto — páginas públicas | ✅ OK 2026-07-01 (ver TC-173/174) |
+| — | Checkout con carrito vacío (URL directa) | ✅ OK 2026-07-01 — redirige a /products |
 | — | Safari iOS / Android Chrome — flujo de checkout completo | — |
 
 ## Matriz de cobertura
@@ -504,8 +593,24 @@ Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android
 sobre el flujo de checkout completo.
 
 ## Hallazgos abiertos
-- 🟢 Menor — Panel admin Ventas (`FRONT/.../admin/pages/Sales`): las tarjetas de
-  stats ("Total ventas", "Pagadas") no cuadran con la lista (hay >8 filas con
-  estados cancelado/expirado/fallido y los contadores muestran 8/8). "Pendientes de
-  pago" sí cuenta bien en vivo (0↔1). Revisar el cálculo/etiquetado de los contadores.
-  No bloqueante. (2026-06-14)
+- 🟢 Menor — Panel admin Ventas: las tarjetas de stats ("Total ventas", "Pagadas") no
+  cuadran con la lista. "Pendientes de pago" sí cuenta bien en vivo (0↔1). No bloqueante.
+  (2026-06-14)
+- 🟡 Medio — HALLAZGO-006 — `/product/:id` a 375px: botón "Agregar al carrito" truncado
+  como "Agregar al car..." en la barra sticky inferior. Los dos botones ("Comprar ahora"
+  y "Agregar al carrito") compiten por el ancho. Fix: reducir font-size, abreviar texto
+  o apilar en columna a ≤400px. Confirmado en Playwright 2026-07-01.
+- 🟡 Medio — HALLAZGO-007 — `/contact`: Cards "Redes Sociales" y "Correo Electrónico"
+  sin CTAs funcionales. Iconos TikTok/Facebook decorativos (sin href). Card Correo sin
+  mailto ni formulario. "Iniciar Chat" de WhatsApp sí funciona. (2026-07-01)
+- 🟡 Medio — HALLAZGO-008 — `AdminRedirect` redirige al admin fuera de rutas públicas,
+  bloqueando pruebas de UI de checkout/productos como admin. No bloqueante para producción.
+  Workaround: usar cuenta de usuario regular para tests de UI. (2026-07-01)
+
+## Stock de zapatos (id=14) al cerrar sesión 2026-07-01
+- Inicio sesión: 10
+- TC-169 "Test QA Transfer" creado → trigger → 9
+- TC-170 confirmar → sin cambio (stock: 9)
+- TC-171 "Test QA Cancel" creado → trigger → 8
+- TC-171 cancelar → restaurado → 9
+- **Stock final: 9**

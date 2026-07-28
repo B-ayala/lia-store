@@ -145,6 +145,7 @@ const initDatabase = async () => {
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS return_policy TEXT`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS images JSONB`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT false`,
+        `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS size_guide JSONB`,
       ];
       for (const sql of alteraciones) {
         await client.query(sql);

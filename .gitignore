@@ -3,10 +3,10 @@ node_modules/
 package-lock.json
 yarn.lock
 
-# Variables de entorno
+# Variables de entorno — todo .env queda fuera salvo el ejemplo
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Logs
 logs/
@@ -42,3 +42,11 @@ Thumbs.db
 # Testing
 coverage/
 .nyc_output/
+
+# Herramientas de agentes / QA local
+.claude/
+.playwright-mcp/
+*.png
+*.jpg
+*.jpeg
+*.webp

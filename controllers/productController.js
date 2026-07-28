@@ -7,7 +7,7 @@ const createProduct = async (req, res) => {
       name, price, stock, category, imageUrl, publicId,
       description, discount, condition, freeShipping,
       variants, specifications, features, faqs, warranty, returnPolicy,
-      status, images,
+      sizeGuide, status, images,
     } = req.body;
 
     if (!name || !price) {
@@ -35,8 +35,8 @@ const createProduct = async (req, res) => {
       `INSERT INTO public.productos
        (name, price, stock, category, image_url, public_id, description,
         discount, condition, free_shipping, variants, specifications, features, faqs,
-        warranty, return_policy, status, images)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        warranty, return_policy, size_guide, status, images)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
        RETURNING *`,
       [
         name,
@@ -55,6 +55,7 @@ const createProduct = async (req, res) => {
         faqs ? JSON.stringify(faqs) : null,
         warranty || null,
         returnPolicy || null,
+        sizeGuide ? JSON.stringify(sizeGuide) : null,
         status || 'active',
         images ? JSON.stringify(images) : null,
       ]
@@ -144,7 +145,7 @@ const updateProduct = async (req, res) => {
       name, price, stock, category, imageUrl, publicId,
       description, discount, condition, freeShipping,
       variants, specifications, features, faqs, warranty, returnPolicy,
-      status, images,
+      sizeGuide, status, images,
     } = req.body;
 
     // Defensa server-side: un producto activo sin stock queda oculto en la tienda.
@@ -240,6 +241,10 @@ const updateProduct = async (req, res) => {
     if (returnPolicy !== undefined) {
       updates.push(`return_policy = $${paramCount++}`);
       values.push(returnPolicy);
+    }
+    if (sizeGuide !== undefined) {
+      updates.push(`size_guide = $${paramCount++}`);
+      values.push(sizeGuide ? JSON.stringify(sizeGuide) : null);
     }
     if (status !== undefined) {
       updates.push(`status = $${paramCount++}`);
