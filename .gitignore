@@ -1,6 +1,5 @@
 # Dependencias
 node_modules/
-package-lock.json
 yarn.lock
 
 # Variables de entorno — todo .env queda fuera salvo el ejemplo

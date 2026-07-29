@@ -25,6 +25,11 @@
   guardaba el `status` tal cual. El estado `inactive` sigue permitiendo stock 0.
 
 ### Fixed
+- `package-lock.json` pasa a versionarse (estaba en `.gitignore`). Sin lockfile, cada build
+  resolvía `pg: "^8.11.3"` a la última 8.x del día, así que producción instalaba algo
+  distinto de lo probado en local y el deploy podía romperse sin cambios en el código.
+  Con el lock presente el builder usa `npm ci` (instalación determinista); queda fijado
+  `pg` 8.21.0.
 - El contenedor de producción crasheaba al arrancar con `Cannot find module 'util/types'`.
   `engines.node` declaraba `>=14.0.0` y el builder resolvía el mínimo (Node 14 / npm 6),
   pero `pg` ^8.11.3 resuelve a una 8.x que requiere Node ≥16. Se fija `22.x` (misma major
