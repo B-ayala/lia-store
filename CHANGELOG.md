@@ -25,6 +25,11 @@
   guardaba el `status` tal cual. El estado `inactive` sigue permitiendo stock 0.
 
 ### Fixed
+- El contenedor de producción crasheaba al arrancar con `Cannot find module 'util/types'`.
+  `engines.node` declaraba `>=14.0.0` y el builder resolvía el mínimo (Node 14 / npm 6),
+  pero `pg` ^8.11.3 resuelve a una 8.x que requiere Node ≥16. Se fija `22.x` (misma major
+  con la que se generó el `package-lock.json`) y se agrega `.nvmrc` para que el builder
+  y el entorno local coincidan.
 - `deleteProduct` ya no borra el asset de Cloudinary si **otro producto comparte el
   mismo `public_id`** (imagen reutilizada): antes, borrar un producto rompía la imagen
   del otro. Se consulta si algún otro producto referencia el `public_id` y, si es así,

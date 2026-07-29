@@ -9,7 +9,7 @@
     "init-db": "node config/initDatabase.js"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": "22.x"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
