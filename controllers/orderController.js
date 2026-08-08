@@ -1,6 +1,9 @@
+const crypto = require('crypto');
 const { pool } = require('../config/database');
 const Order = require('../models/Order');
 const mercadopago = require('../utils/mercadopago');
+const { caches, invalidateProducts } = require('../utils/cache');
+const logger = require('../utils/logger');
 
 // Ventanas de expiración — deben coincidir con las que muestra el frontend
 // (MP_EXPIRY_MS / TRANSFER_EXPIRY_MS en admin/pages/Sales).
@@ -19,6 +22,35 @@ const NUDGE_ORIGIN = {
 };
 const MAX_NUDGE_ORDERS = 50;
 
+const MAX_ORDER_ITEMS = 50;
+const DEFAULT_ORDER_PAGE_SIZE = 200;
+const MAX_ORDER_PAGE_SIZE = 500;
+
+/** Entero saneado dentro de [min, max]; cae al default si no es válido. */
+const boundedInt = (raw, fallback, min, max) => {
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(value, min), max);
+};
+
+/**
+ * Clave de deduplicación de una compra: mismo usuario + mismo carrito.
+ *
+ * Sirve para colapsar el doble submit (doble click, reintento del usuario
+ * mientras la primera request sigue en vuelo), que hoy generaría DOS juegos de
+ * ventas pendientes y descontaría el stock dos veces vía trigger.
+ */
+const orderDedupeKey = (prefix, req) => {
+  const payload = JSON.stringify({
+    items: req.body.items,
+    shippingMethod: req.body.shippingMethod,
+    shippingCost: req.body.shippingCost,
+    totalPrice: req.body.totalPrice,
+  });
+  const owner = (req.user && req.user.id) || req.body.buyerEmail || 'anon';
+  return `${prefix}:${owner}:${crypto.createHash('sha256').update(payload).digest('hex')}`;
+};
+
 const getFrontendOrigin = () =>
   (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
 
@@ -30,6 +62,11 @@ const validateOrderPayload = ({ buyerName, buyerEmail, items, totalPrice }) => {
   }
   if (!Array.isArray(items) || items.length === 0) {
     return 'No hay productos en el carrito para procesar la compra.';
+  }
+  // Cota dura: cada ítem es un bloqueo de fila dentro de la transacción, así que
+  // un carrito absurdo mantendría el lock (y una conexión del pool) demasiado tiempo.
+  if (items.length > MAX_ORDER_ITEMS) {
+    return `El carrito supera el máximo de ${MAX_ORDER_ITEMS} productos por compra.`;
   }
   for (const item of items) {
     if (!item || !item.productName || !String(item.productName).trim()) {
@@ -90,21 +127,18 @@ const buildPreferencePayload = ({ buyerName, buyerEmail, items, shippingCost, or
 };
 
 /**
- * @desc    Crea preferencia de Mercado Pago, registra ventas pendientes y reserva stock
- * @route   POST /api/orders/mp-preference
+ * Reserva el stock e inserta las ventas pendientes en una única transacción corta.
+ *
+ * El trigger `trg_decrement_stock` descuenta al insertar la venta, pero con
+ * `GREATEST(stock,0)`, que permitiría sobreventa silenciosa: por eso se valida
+ * disponibilidad con la fila bloqueada (`FOR UPDATE`) antes de insertar. El lock
+ * se mantiene hasta el COMMIT, así que las líneas posteriores del mismo producto
+ * ya ven el stock que descontó el trigger en este loop, y dos compras
+ * simultáneas del último ítem se serializan (una gana, la otra recibe 409).
+ *
+ * @returns {Promise<{ok: true, orderIds: string[]} | {ok: false, status: number, message: string}>}
  */
-const createMpPreference = async (req, res) => {
-  const { buyerName, buyerEmail, items, shippingMethod, shippingCost, totalPrice } = req.body;
-
-  const validationError = validateOrderPayload({ buyerName, buyerEmail, items, totalPrice });
-  if (validationError) {
-    return res.status(400).json({ success: false, message: validationError });
-  }
-
-  if (!mercadopago.isConfigured()) {
-    return res.status(503).json({ success: false, message: MP_NOT_CONFIGURED_MESSAGE });
-  }
-
+const reserveOrders = async ({ buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod }) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -117,18 +151,14 @@ const createMpPreference = async (req, res) => {
       const hasProductId = Number.isInteger(productId);
 
       if (hasProductId) {
-        // El trigger trg_decrement_stock descuenta al insertar la venta, pero
-        // con GREATEST(stock,0), que permitiría sobreventa silenciosa. Validamos
-        // disponibilidad con la fila bloqueada (FOR UPDATE) antes de insertar.
-        // El lock se mantiene hasta el COMMIT, así que las líneas posteriores del
-        // mismo producto ya ven el stock que descontó el trigger en este loop.
         const available = await Order.getStockForUpdate(client, productId);
         if (available === null || available < item.quantity) {
           await client.query('ROLLBACK');
-          return res.status(409).json({
-            success: false,
+          return {
+            ok: false,
+            status: 409,
             message: `No hay stock suficiente de "${item.productName}".`,
-          });
+          };
         }
       }
 
@@ -143,36 +173,121 @@ const createMpPreference = async (req, res) => {
         // El costo de envío se suma a la primera línea (mismo criterio que el frontend)
         totalPrice: item.totalPrice + (index === 0 ? surcharge : 0),
         unitsConfig: item.unitsConfig,
-        paymentMethod: 'mp',
+        paymentMethod,
         shippingMethod,
       });
       orderIds.push(orderId);
     }
 
+    await client.query('COMMIT');
+    invalidateProducts();
+    return { ok: true, orderIds };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    console.error(`Error al reservar órdenes (${paymentMethod}):`, error.message);
+    return { ok: false, status: 500, message: 'No se pudo registrar la orden. Intentá de nuevo.' };
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Compensación: cancela reservas recién creadas y devuelve su stock.
+ * Se usa cuando la reserva salió bien pero el paso siguiente falló (ej. Mercado
+ * Pago no devolvió preferencia), para que el usuario vea el mismo resultado que
+ * antes —nada persistido— sin haber tenido que mantener la transacción abierta
+ * durante la llamada externa.
+ */
+const releaseOrders = async (orderIds) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const id of orderIds) {
+      const order = await Order.findByIdForUpdate(client, id);
+      if (!order || order.payment_status !== 'pendiente') continue;
+      await Order.setStatus(client, order.id, 'cancelado');
+      await Order.restoreStock(client, order.product_id, order.quantity);
+    }
+    await client.query('COMMIT');
+    invalidateProducts();
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    // No se propaga: el sweep de órdenes vencidas (cada 60 s) es la red de
+    // seguridad si esta compensación falla.
+    console.error('Error al liberar reservas de órdenes:', error.message);
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Crea preferencia de Mercado Pago sobre reservas ya confirmadas.
+ *
+ * La llamada HTTP a Mercado Pago queda FUERA de la transacción a propósito: si
+ * se hiciera adentro, cada checkout en curso retendría una conexión del pool
+ * durante todo el round trip externo (cientos de ms) y con 20 conexiones
+ * bastarían 20 compras simultáneas para frenar toda la API.
+ */
+const buildMpCheckout = async (req) => {
+  const { buyerName, buyerEmail, items, shippingMethod, shippingCost } = req.body;
+
+  const reservation = await reserveOrders({
+    buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod: 'mp',
+  });
+  if (!reservation.ok) {
+    return { status: reservation.status, body: { success: false, message: reservation.message } };
+  }
+
+  try {
     const preference = await mercadopago.createPreference(
-      buildPreferencePayload({ buyerName, buyerEmail, items, shippingCost, orderIds })
+      buildPreferencePayload({ buyerName, buyerEmail, items, shippingCost, orderIds: reservation.orderIds })
     );
 
     if (!preference || !preference.init_point) {
       throw new Error('Mercado Pago no devolvió init_point');
     }
 
-    await client.query('COMMIT');
-    return res.status(201).json({
-      success: true,
-      init_point: preference.init_point,
-      order_ids: orderIds.map(String),
-    });
+    return {
+      status: 201,
+      body: {
+        success: true,
+        init_point: preference.init_point,
+        order_ids: reservation.orderIds.map(String),
+      },
+    };
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
     console.error('Error en createMpPreference:', error.message);
-    return res.status(502).json({
-      success: false,
-      message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
-    });
-  } finally {
-    client.release();
+    await releaseOrders(reservation.orderIds);
+    return {
+      status: 502,
+      body: {
+        success: false,
+        message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
+      },
+    };
   }
+};
+
+/**
+ * @desc    Crea preferencia de Mercado Pago, registra ventas pendientes y reserva stock
+ * @route   POST /api/orders/mp-preference
+ */
+const createMpPreference = async (req, res) => {
+  const { buyerName, buyerEmail, items, totalPrice } = req.body;
+
+  const validationError = validateOrderPayload({ buyerName, buyerEmail, items, totalPrice });
+  if (validationError) {
+    return res.status(400).json({ success: false, message: validationError });
+  }
+
+  if (!mercadopago.isConfigured()) {
+    return res.status(503).json({ success: false, message: MP_NOT_CONFIGURED_MESSAGE });
+  }
+
+  // Doble click / reintento con la primera request todavía en vuelo: se comparte
+  // la misma ejecución en vez de crear dos juegos de ventas y descontar dos veces.
+  const { status, body } = await caches.orders.single(orderDedupeKey('mp', req), () => buildMpCheckout(req));
+  return res.status(status).json(body);
 };
 
 /**
@@ -188,53 +303,14 @@ const createTransferOrder = async (req, res) => {
     return res.status(400).json({ success: false, message: validationError });
   }
 
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  const reservation = await caches.orders.single(orderDedupeKey('transfer', req), () =>
+    reserveOrders({ buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod: 'transfer' })
+  );
 
-    const surcharge = Number.isFinite(Number(shippingCost)) ? Number(shippingCost) : 0;
-    const orderIds = [];
-
-    for (const [index, item] of items.entries()) {
-      const productId = Number.parseInt(item.productId, 10);
-      const hasProductId = Number.isInteger(productId);
-
-      if (hasProductId) {
-        const available = await Order.getStockForUpdate(client, productId);
-        if (available === null || available < item.quantity) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({
-            success: false,
-            message: `No hay stock suficiente de "${item.productName}".`,
-          });
-        }
-      }
-
-      const orderId = await Order.insertPending(client, {
-        buyerName,
-        buyerEmail,
-        productId: hasProductId ? productId : null,
-        productName: item.productName,
-        productImage: item.productImage,
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
-        totalPrice: item.totalPrice + (index === 0 ? surcharge : 0),
-        unitsConfig: item.unitsConfig,
-        paymentMethod: 'transfer',
-        shippingMethod,
-      });
-      orderIds.push(orderId);
-    }
-
-    await client.query('COMMIT');
-    return res.status(201).json({ success: true, order_ids: orderIds.map(String) });
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    console.error('Error en createTransferOrder:', error.message);
-    return res.status(500).json({ success: false, message: 'No se pudo registrar la orden. Intentá de nuevo.' });
-  } finally {
-    client.release();
+  if (!reservation.ok) {
+    return res.status(reservation.status).json({ success: false, message: reservation.message });
   }
+  return res.status(201).json({ success: true, order_ids: reservation.orderIds.map(String) });
 };
 
 /**
@@ -256,8 +332,22 @@ const getUserOrders = async (req, res) => {
       });
     }
 
-    const orders = await Order.findPaidByEmail(email);
-    return res.status(200).json({ success: true, orders });
+    // Paginado con tope: "Mis compras" de un cliente fiel puede tener cientos de
+    // líneas y devolverlas todas serializa un JSON grande por request.
+    // El default cubre el histórico completo de un usuario normal, así que el
+    // frontend actual (que no pagina) sigue funcionando igual.
+    const limit = boundedInt(req.query.limit, DEFAULT_ORDER_PAGE_SIZE, 1, MAX_ORDER_PAGE_SIZE);
+    const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+
+    const { rows, total } = await Order.findPaidByEmail(email, limit, offset);
+    return res.status(200).json({
+      success: true,
+      orders: rows,
+      total,
+      limit,
+      offset,
+      hasMore: offset + rows.length < total,
+    });
   } catch (error) {
     console.error('Error en getUserOrders:', error.message);
     return res.status(500).json({ success: false, message: 'Error al cargar las compras' });
@@ -287,6 +377,9 @@ const confirmMpPayment = async (req, res) => {
 
     const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
     const updated = ids.length > 0 ? await Order.markPaidByIds(ids) : 0;
+    // Un pago acreditado tarde vuelve a descontar stock: el catálogo cacheado
+    // tiene que reflejarlo ya.
+    if (updated > 0) invalidateProducts();
 
     return res.status(200).json({ success: true, orders_paid: updated });
   } catch (error) {
@@ -312,7 +405,10 @@ const mpWebhook = async (req, res) => {
     const payment = await mercadopago.getPayment(paymentId);
     if (payment && payment.status === 'approved' && payment.external_reference) {
       const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
-      if (ids.length > 0) await Order.markPaidByIds(ids);
+      if (ids.length > 0) {
+        await Order.markPaidByIds(ids);
+        invalidateProducts();
+      }
     }
 
     return res.status(200).json({ success: true });
@@ -366,6 +462,7 @@ const cancelOrder = async (req, res) => {
     await Order.restoreStock(client, order.product_id, order.quantity);
 
     await client.query('COMMIT');
+    invalidateProducts();
     return res.status(200).json({ success: true, message: 'Orden cancelada' });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
@@ -411,6 +508,7 @@ const resolveTransferOrder = async (req, res, targetStatus) => {
 
     await Order.setStatus(client, order.id, targetStatus);
     await client.query('COMMIT');
+    if (targetStatus === 'cancelado') invalidateProducts();
     return res.status(200).json({
       success: true,
       message: targetStatus === 'pagado' ? 'Pago confirmado' : 'Orden cancelada',
@@ -483,6 +581,7 @@ const recordNudge = async (req, res) => {
       applied += 1;
     }
     await client.query('COMMIT');
+    if (origin === NUDGE_ORIGIN.abandonado && applied > 0) invalidateProducts();
     return res.status(200).json({ success: true, applied });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
@@ -501,7 +600,8 @@ const expireStaleOrders = async () => {
   try {
     const { mp, transfer } = await Order.expireStale(MP_EXPIRY_MINUTES, TRANSFER_EXPIRY_HOURS);
     if (mp > 0 || transfer > 0) {
-      console.log(`Sweep de órdenes: ${mp} MP y ${transfer} transferencias expiradas`);
+      invalidateProducts(); // el sweep devolvió stock: el catálogo cacheado quedó viejo
+      logger.info('orders_sweep', { expiredMp: mp, expiredTransfer: transfer });
     }
   } catch (error) {
     console.error('Error en sweep de órdenes:', error.message);

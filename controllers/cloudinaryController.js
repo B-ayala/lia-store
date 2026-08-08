@@ -28,9 +28,6 @@ const generateSignature = (req, res) => {
       .update(signatureString)
       .digest('hex');
 
-    console.log('Signature generated for params:', Object.keys(paramsToSign).sort().join(', '));
-    console.log('Signature:', signature);
-
     res.json({
       success: true,
       data: {

@@ -550,6 +550,138 @@ Resultado: OK con HALLAZGO-007 (2026-07-01, Playwright; "Iniciar Chat" → wa.me
 
 ---
 
+### Concurrencia y carga (`TC-180`–`TC-193`)
+
+Suite automatizada: `node qa/load-test.js http://localhost:3000` (backend levantado).
+Ejecutada el **2026-08-08** contra local + Supabase real. Detalle del mecanismo en
+`docs/flows/flow-concurrencia-carga.md`.
+
+```
+ID: TC-180
+Caso: Catálogo con 5 / 20 / 50 usuarios simultáneos
+Tipo: happy / concurrencia
+Pre-condición: backend levantado, caché fría
+Pasos:
+  1. node qa/load-test.js http://localhost:3000 → SUITE 1
+Esperado: 0% de error y sin degradación progresiva; p90 < 800 ms
+Resultado: OK (2026-08-08 — p90 12/24/30 ms para 5/20/50 VUs, 0% error)
+
+ID: TC-181
+Caso: 30 lecturas concurrentes del mismo producto (coalescing)
+Tipo: concurrencia
+Pasos:
+  1. SUITE 2 del load-test
+  2. GET /health → caches[products].coalesced
+Esperado: 0% error; contador `coalesced` > 0 (las lecturas simultáneas comparten query)
+Resultado: OK (2026-08-08 — 0% error, coalesced=42 en la corrida)
+
+ID: TC-182
+Caso: Consistencia de stock bajo 50 lecturas concurrentes
+Tipo: concurrencia / datos
+Esperado: todas las lecturas reportan el MISMO stock (sin caché divergente)
+Resultado: OK (2026-08-08 — 50/50 con stock=3)
+
+ID: TC-183
+Caso: Catálogo devuelve Cache-Control y ETag
+Tipo: happy
+Pasos:
+  1. curl -D - "http://localhost:3000/api/products?limit=5&offset=0"
+Esperado: `Cache-Control: public, max-age=30, stale-while-revalidate=90` + `ETag`
+Resultado: OK (2026-08-08)
+
+ID: TC-184
+Caso: Revalidación condicional devuelve 304 sin cuerpo
+Tipo: happy
+Pasos:
+  1. Repetir el GET con `If-None-Match: <etag>`
+Esperado: 304, sin body
+Resultado: OK (2026-08-08 — con curl y con navegador. Nota: el `fetch` de Node
+  descarta headers condicionales salvo `cache: 'no-cache'`; no es un bug del backend)
+
+ID: TC-185
+Caso: Respuesta comprimida cuando el cliente lo acepta
+Tipo: happy
+Pasos:
+  1. GET /api/products con `Accept-Encoding: gzip`
+Esperado: `Content-Encoding: gzip`
+Resultado: OK (2026-08-08)
+
+ID: TC-186
+Caso: Rate limit de login bloquea con 429 y headers estándar
+Tipo: security
+Pasos:
+  1. 14 POST /api/users/login seguidos con credenciales inválidas
+Esperado: los primeros 10 pasan (401), el resto 429 con `Retry-After` y `X-RateLimit-*`
+Resultado: OK (2026-08-08 — 4 bloqueados con 429, headers presentes)
+
+ID: TC-187
+Caso: Recuperación tras el Retry-After del rate limit
+Tipo: edge
+Pasos:
+  1. Provocar 429 en /api/users/login
+  2. Esperar los segundos que indica `Retry-After`
+  3. Reintentar
+Esperado: vuelve a responder 401 (no 429)
+Resultado: OK (2026-08-08 — verificado al reejecutar la suite tras la ventana)
+
+ID: TC-188
+Caso: Saturación — 800 requests concurrentes todas cache-miss
+Tipo: failure / concurrencia
+Pasos:
+  1. Disparar 800 GET /api/products?limit=1&offset=<i único>
+  2. GET /health al terminar
+Esperado: sin errores 500; los excedentes reciben 503 `SERVER_BUSY` con `Retry-After`;
+  el pool no supera su máximo; la cola queda en 0
+Resultado: OK (2026-08-08 — 224×200, 576×503, 0×500, pool 12/12 idle, queueLength=0)
+
+ID: TC-189
+Caso: Pool de PostgreSQL no excede el techo de Supabase
+Tipo: failure
+Pre-condición: pooler de Supabase en modo sesión (máx. 15 clientes)
+Esperado: ningún error `EMAXCONNSESSION` en el log durante la saturación
+Resultado: OK (2026-08-08 — con DB_POOL_MAX=12. Con el valor anterior (20) se
+  reprodujeron 36 errores: ese fue el origen del ajuste)
+
+ID: TC-190
+Caso: /health expone métricas de pool, concurrencia, rate limit y cachés
+Tipo: happy / observabilidad
+Esperado: 200 con `db`, `concurrency`, `rateLimit`, `caches`; responde incluso saturado
+Resultado: OK (2026-08-08 — responde durante el burst, queda fuera del bulkhead)
+
+ID: TC-191
+Caso: Apagado ordenado ante SIGTERM (deploy de Railway)
+Tipo: failure / operación
+Pasos:
+  1. Levantar el backend y emitir SIGTERM
+Esperado: log `shutdown_started` → `shutdown_completed`, exit 0, pool cerrado
+Resultado: OK (2026-08-08 — en Windows se verificó emitiendo la señal desde el
+  proceso, porque el SO no tiene SIGTERM real; en Railway/Linux es nativo)
+
+ID: TC-192
+Caso: Doble submit del checkout no duplica órdenes ni descuenta stock dos veces
+Tipo: concurrencia / datos
+Pre-condición: usuario logueado, producto con stock ≥ 1
+Pasos:
+  1. Disparar dos POST /api/orders/mp-preference idénticos en paralelo
+  2. Verificar en Supabase: SELECT * FROM ventas WHERE buyer_email = … ORDER BY created_at DESC
+  3. Verificar stock del producto
+Esperado: un único juego de ventas; stock descontado una sola vez
+Resultado: NO PROBADO — requiere token de usuario logueado y token de MP
+  (pendiente en la próxima sesión de QA con Playwright)
+
+ID: TC-193
+Caso: Payload rechazado por tamaño y por JSON inválido
+Tipo: edge / security
+Pasos:
+  1. POST /api/orders/transfer con body > 256 kb
+  2. POST /api/orders/transfer con JSON malformado
+Esperado: 413 `PAYLOAD_TOO_LARGE` y 400 `INVALID_JSON` (nunca 500)
+Resultado: OK (2026-08-08 — 413 con body de 400 kb, 400 con JSON roto; sin token
+  sigue devolviendo 401, así que el orden de middlewares no cambió)
+```
+
+---
+
 ## Casos pendientes sin probar (backlog)
 
 | ID | Caso | Bloqueante |
@@ -574,6 +706,7 @@ Resultado: OK con HALLAZGO-007 (2026-07-01, Playwright; "Iniciar Chat" → wa.me
 | — | About, Contacto — páginas públicas | ✅ OK 2026-07-01 (ver TC-173/174) |
 | — | Checkout con carrito vacío (URL directa) | ✅ OK 2026-07-01 — redirige a /products |
 | — | Safari iOS / Android Chrome — flujo de checkout completo | — |
+| TC-192 | Doble submit del checkout no duplica órdenes | necesita usuario logueado + token MP |
 
 ## Matriz de cobertura
 
@@ -587,6 +720,7 @@ Resultado: OK con HALLAZGO-007 (2026-07-01, Playwright; "Iniciar Chat" → wa.me
 | Auth/usuarios | TC-131 | — | — | TC-130 | — |
 | Front data layer | TC-141 | — | TC-140 | — | — |
 | Asistente insights | TC-150 | TC-153/154 | TC-155 | TC-151/152 | — |
+| Concurrencia y carga | TC-180/183/185/190 | TC-184/187/193 | TC-188/189/191 | TC-186 | TC-181/182/192 |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android

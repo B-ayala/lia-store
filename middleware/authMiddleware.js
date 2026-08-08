@@ -6,10 +6,19 @@
  */
 
 const https = require('https');
+const crypto = require('crypto');
 const { pool } = require('../config/database');
+const { caches, TTL } = require('../utils/cache');
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+
+/**
+ * Clave de caché del token: SHA-256, nunca el token en claro. Aunque la caché
+ * es en memoria, un dump de proceso o un log accidental no debe filtrar
+ * credenciales reutilizables.
+ */
+const tokenCacheKey = (token) => `token:${crypto.createHash('sha256').update(token).digest('hex')}`;
 
 /**
  * Verifica el access token contra Supabase Auth (GET /auth/v1/user).
@@ -44,6 +53,56 @@ const verifySupabaseToken = (token) =>
     request.end();
   });
 
+/**
+ * Resuelve el usuario de la request: verifica el token contra Supabase y lee su
+ * rol de `profiles`.
+ * @returns {Promise<object|null>} usuario de la request, o null si el token no vale.
+ */
+const resolveRequestUser = async (token) => {
+  const supabaseUser = await verifySupabaseToken(token);
+  if (!supabaseUser) return null;
+
+  const result = await pool.query(
+    'SELECT id, role, name FROM public.profiles WHERE id = $1',
+    [supabaseUser.id]
+  );
+  if (result.rows.length === 0) return null;
+
+  const profile = result.rows[0];
+  return {
+    id: profile.id,
+    name: profile.name,
+    email: supabaseUser.email || null,
+    role: profile.role || 'user',
+  };
+};
+
+/**
+ * Igual que `resolveRequestUser`, pero con caché de corta duración y
+ * single-flight.
+ *
+ * Sin esto, CADA request autenticada hace un round trip HTTPS a Supabase Auth
+ * más una query a `profiles`: navegar el panel admin dispara decenas de
+ * verificaciones idénticas del mismo token y la latencia externa se vuelve el
+ * cuello de botella bajo carga.
+ *
+ * Trade-off explícito: un token revocado puede seguir siendo aceptado hasta
+ * `CACHE_TTL_AUTH_SECONDS` (30 s por defecto, `0` desactiva la caché).
+ */
+const resolveRequestUserCached = async (token) => {
+  if (!(TTL.auth > 0)) return resolveRequestUser(token);
+
+  const key = tokenCacheKey(token);
+  const cached = caches.auth.get(key);
+  if (cached) return cached;
+
+  // Sólo se cachean verificaciones exitosas: un token inválido debe volver a
+  // consultarse siempre (no se le regala al atacante una respuesta memorizada).
+  const user = await caches.auth.single(key, () => resolveRequestUser(token));
+  if (user) caches.auth.set(key, user, TTL.auth);
+  return user;
+};
+
 const authMiddleware = async (req, res, next) => {
   try {
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
@@ -64,34 +123,15 @@ const authMiddleware = async (req, res, next) => {
 
     const token = authHeader.substring(7);
 
-    const supabaseUser = await verifySupabaseToken(token);
-    if (!supabaseUser) {
+    const user = await resolveRequestUserCached(token);
+    if (!user) {
       return res.status(401).json({
         success: false,
         message: 'Token inválido o expirado',
       });
     }
 
-    // El rol se lee de la tabla profiles usando el ID ya verificado por Supabase.
-    const result = await pool.query(
-      'SELECT id, role, name FROM public.profiles WHERE id = $1',
-      [supabaseUser.id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({
-        success: false,
-        message: 'Usuario no encontrado en la base de datos',
-      });
-    }
-
-    const profile = result.rows[0];
-    req.user = {
-      id: profile.id,
-      name: profile.name,
-      email: supabaseUser.email || null,
-      role: profile.role || 'user',
-    };
+    req.user = user;
     req.token = token;
 
     next();

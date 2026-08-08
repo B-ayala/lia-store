@@ -30,6 +30,7 @@ La autenticación se basa en el **JWT de Supabase Auth** que emite el frontend: 
 | Dependencia | Versión | Uso |
 |---|---|---|
 | `express` | ^4.18.2 | servidor HTTP / routing |
+| `compression` | ^1.8.1 | gzip de las respuestas (el JSON del catálogo es muy repetitivo) |
 | `pg` | ^8.11.3 | cliente PostgreSQL (pool) |
 | `jsonwebtoken` | ^9.0.3 | **decodificar** el JWT de Supabase (no se verifica firma — ver §10) |
 | `bcryptjs` | ^2.4.3 | hashing de passwords (declarado; sin uso activo en el código actual) |
@@ -46,35 +47,67 @@ La autenticación se basa en el **JWT de Supabase Auth** que emite el frontend: 
 
 ```
 lia-store/
-├── server.js                  # Entry point: Express, CORS, montaje de rutas, error handler, arranque tras connectDB
+├── server.js                  # Entry point: compresión, CORS, límites de body, rate limit global,
+│                              # bulkhead, montaje de rutas, /health, error handler, apagado ordenado
 ├── package.json               # deps + scripts (start / dev / init-db)
-├── .env.example               # plantilla de variables de entorno  ⚠️ (ver §10: contiene credenciales reales)
+├── .env.example               # plantilla de variables de entorno
 ├── .gitignore
 │
 ├── config/
-│   ├── database.js            # Pool de pg (SSL), connectDB() con reintentos, verificación de tabla profiles
-│   ├── initDatabase.js        # `npm run init-db`: crea/verifica profiles, RLS, trigger handle_new_user, carousel_images, columnas de productos
+│   ├── database.js            # Pool de pg (SSL) parametrizable + timeouts, connectDB() con reintentos,
+│   │                          # getPoolStats() para /health y closeDB() para el apagado
+│   ├── cors.js                # allowlist por FRONTEND_URL (+ cualquier localhost en desarrollo)
+│   ├── initDatabase.js        # `npm run init-db`: profiles, RLS, trigger handle_new_user, carousel_images…
 │   └── migrateData.js         # script legacy de migración MongoDB → PostgreSQL (referencia, opcional)
 │
-├── routes/                    # Definición de endpoints (Express Router)
-│   ├── userRoutes.js          # /api/users
-│   ├── productRoutes.js       # /api/products  (con auth+admin en escritura)
+├── db/migrations/             # SQL versionado (se corre en el SQL Editor de Supabase)
+│   ├── 2026-06-16_add_origin_to_ventas.sql
+│   └── 2026-08-08_add_performance_indexes.sql   # índices de las consultas calientes
+│
+├── routes/                    # Endpoints + su rate limit y política de caché HTTP
+│   ├── userRoutes.js          # /api/users            (login con el límite más estricto)
+│   ├── productRoutes.js       # /api/products         (lectura pública cacheable; escritura admin)
+│   ├── orderRoutes.js         # /api/orders           (checkout, webhook, nudge; todo no-store)
+│   ├── shippingRoutes.js      # /api/shipping         (tarifa plana, cacheable 5 min)
+│   ├── insightsRoutes.js      # /api/admin/insights   (solo admin)
 │   └── cloudinaryRoutes.js    # /api/cloudinary
 │
 ├── controllers/               # Lógica de cada endpoint
 │   ├── userController.js       # login, CRUD de perfiles, signup status/ratelimit, getUserByAuthId
-│   ├── productController.js    # CRUD de productos con SQL parametrizado + borrado de imagen en Cloudinary
-│   └── cloudinaryController.js # firma SHA1, delete, getImages, getConfig, folders (get/create/delete)
+│   ├── productController.js    # CRUD + catálogo paginado y cacheado; errores 500 genéricos
+│   ├── orderController.js      # reserva de stock, preferencia MP, transferencias, nudge, sweep
+│   ├── insightsController.js   # analítica del asistente admin (cacheada 60 s)
+│   ├── shippingController.js   # cotización por código postal
+│   └── cloudinaryController.js # firma SHA1, delete, getImages, getConfig, folders
 │
-├── models/
-│   └── User.js                # Capa de datos de profiles (findById, findAll, findByIdAndUpdate, findByIdAndDelete)
+├── models/                    # Acceso a datos (SQL parametrizado)
+│   ├── User.js                # profiles
+│   ├── Order.js               # ventas + stock (FOR UPDATE, expiración, pago tardío)
+│   └── Insights.js            # agregaciones de analítica
 │
 ├── middleware/
-│   ├── authMiddleware.js       # authMiddleware (decodifica JWT + busca rol en profiles) + adminMiddleware
+│   ├── authMiddleware.js       # verifica el token contra Supabase (con caché corta) + adminMiddleware
+│   ├── rateLimit.js            # límites por endpoint (ventana deslizante) con headers estándar
+│   ├── concurrencyLimit.js     # bulkhead + cola con timeout → 503 en vez de colapso
+│   ├── httpCache.js            # Cache-Control público / no-store
 │   └── signupTracker.js        # rate-limit de signup in-memory (Map por email)
 │
+├── utils/
+│   ├── cache.js               # caché TTL + single-flight (coalescing) e invalidación del catálogo
+│   ├── logger.js              # logs estructurados JSON, nivelados por LOG_LEVEL
+│   └── mercadopago.js         # cliente de la API de Mercado Pago
+│
+├── qa/
+│   ├── test-plan.md           # plan de pruebas (incluye TC-180–TC-193 de concurrencia y carga)
+│   └── load-test.js           # suite de carga y concurrencia sin dependencias
+│
 └── docs/
-    └── SUPABASE_AUTH.md        # notas sobre el modelo de auth con Supabase
+    ├── SUPABASE_AUTH.md        # notas sobre el modelo de auth con Supabase
+    └── flows/
+        ├── flow-checkout.md
+        ├── flow-admin-assistant.md
+        ├── flow-despliegue-produccion.md
+        └── flow-concurrencia-carga.md   # capas de defensa ante carga y concurrencia
 ```
 
 > El repo trae además documentación propia: `README.md`, `ARCHITECTURE.md`, `QUICKSTART.md`,
@@ -215,38 +248,105 @@ Definidas en `.env` (plantilla en `.env.example`). El backend usa **conexión di
 | `DB_PASSWORD` | ✅ | **Secreto.** Password de la BD. |
 | `DB_NAME` | ✅ | Base (`postgres`). |
 | `FRONTEND_URL` | ✅ (recomendada) | Allowlist de CORS (coma-separada). Default `http://localhost:5173`. |
-| `CLOUDINARY_CLOUD_NAME` | ✅ (Cloudinary) | Cloud name. **Falta en `.env.example`.** |
-| `CLOUDINARY_API_KEY` | ✅ (Cloudinary) | API key. **Falta en `.env.example`.** |
-| `CLOUDINARY_API_SECRET` | ✅ (Cloudinary) | **Secreto.** Para firmar/borrar. **Falta en `.env.example`.** |
+| `CLOUDINARY_CLOUD_NAME` | ✅ (Cloudinary) | Cloud name. |
+| `CLOUDINARY_API_KEY` | ✅ (Cloudinary) | API key. |
+| `CLOUDINARY_API_SECRET` | ✅ (Cloudinary) | **Secreto.** Para firmar/borrar. |
+| `SUPABASE_URL` | ✅ (auth) | Proyecto Supabase contra el que `authMiddleware` verifica los access tokens. Sin ella, toda ruta protegida falla. |
+| `SUPABASE_ANON_KEY` | ✅ (auth) | Anon key usada en la verificación del token y en `userController`. |
+| `MP_ACCESS_TOKEN` | ✅ (Mercado Pago) | **Secreto.** Sin ella, `/api/orders/mp-*` responde **503**; la transferencia bancaria sigue funcionando. |
+| `MP_WEBHOOK_URL` | — | URL pública del webhook (`https://…/api/orders/mp-webhook`). En local no aplica salvo que expongas el backend por túnel. |
+
+### 8.1 Concurrencia, carga y caché (opcionales)
+
+Todas tienen default productivo; se listan para poder ajustar sin tocar código.
+Detalle del mecanismo en [`docs/flows/flow-concurrencia-carga.md`](docs/flows/flow-concurrencia-carga.md).
+
+| Variable | Default | Uso |
+|---|---|---|
+| `DB_POOL_MAX` | `12` | Conexiones máximas del pool. **Techo real: 15** — el pooler de Supabase en modo sesión responde `EMAXCONNSESSION` al pasarse. |
+| `DB_POOL_MIN` | `2` | Conexiones tibias para no pagar handshake en cada pico. |
+| `DB_IDLE_TIMEOUT_MS` | `30000` | Cierre de conexiones ociosas. |
+| `DB_CONNECTION_TIMEOUT_MS` | `5000` | Espera máxima por una conexión del pool. |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000` | Corta queries colgadas del lado del servidor Postgres. |
+| `DB_QUERY_TIMEOUT_MS` | `10000` | Ídem del lado del cliente `pg`. |
+| `MAX_CONCURRENT_REQUESTS` | `DB_POOL_MAX × 2` | Handlers simultáneos admitidos (bulkhead). |
+| `MAX_QUEUED_REQUESTS` | `200` | Cola de espera; al llenarse se responde **503 + `Retry-After`**. |
+| `QUEUE_TIMEOUT_MS` | `8000` | Espera máxima en cola antes de devolver 503. |
+| `CACHE_TTL_PRODUCTS_SECONDS` | `20` | Caché del catálogo. `0` la desactiva. Se invalida sola ante cambios de producto/stock. |
+| `CACHE_TTL_INSIGHTS_SECONDS` | `60` | Caché de la analítica admin. |
+| `CACHE_TTL_AUTH_SECONDS` | `30` | Caché de verificación de token. ⚠️ Un token revocado sigue siendo válido como máximo este tiempo. |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
+
+`GET /health` expone en vivo el estado del pool, del bulkhead, del rate limit y de las cachés.
 
 > El pool de `pg` usa `ssl: { rejectUnauthorized: false }`.
+>
+> CORS (`config/cors.js`): en `NODE_ENV != production` se acepta **cualquier** origen
+> `localhost` / `127.0.0.1` en cualquier puerto (Vite salta a 5174 si 5173 está ocupado),
+> además de la allowlist de `FRONTEND_URL`. En producción, solo la allowlist.
 
 ---
 
 ## 9. Cómo levantar el proyecto
 
-```bash
-# Requisitos: Node >= 14 (el frontend usa 22.x; alinear a la versión del front es lo más seguro)
+Requisito: **Node 22.x** (`.nvmrc` y `engines.node`).
+
+```powershell
+# Desde la raíz del repo backend
+cd "BACK/lia-store"
 
 # 1. Instalar dependencias
 npm install
 
-# 2. Crear .env (a partir de .env.example) con DB_*, FRONTEND_URL y CLOUDINARY_*
-#    ⚠️ NO reutilizar las credenciales del .env.example (ver §10) — rotalas.
+# 2. Crear .env a partir de .env.example y completar:
+#    DB_* · FRONTEND_URL · CLOUDINARY_* · SUPABASE_URL · SUPABASE_ANON_KEY · MP_ACCESS_TOKEN
 
-# 3. (Opcional) Inicializar/alinear el esquema en una BD nueva
+# 3. (Solo en una BD nueva) alinear el esquema — idempotente
 npm run init-db
 
 # 4. Levantar
-npm run dev      # nodemon (desarrollo)
+npm run dev      # nodemon, recarga al guardar
 npm start        # node server.js (producción)
-
-# Verificación rápida
-#   GET http://localhost:3000/health  → { "status": "OK" }
 ```
 
-El frontend que apunta a esta API está en `../../FRONT/damiana-bella` y se configura con
-`VITE_API_URL_LOCAL=http://localhost:3000/api`. **Antes de integrarlos, leé la §11.**
+Queda escuchando en **http://localhost:3000**, con la API bajo **`/api`**.
+
+```powershell
+# Verificación rápida
+curl http://localhost:3000/health      # → { "status": "OK" }
+```
+
+Al arrancar, `server.js` primero conecta a Postgres (`connectDB`): si la BD no responde, el
+proceso **sale con código 1** y no levanta el servidor. Además arranca el sweep de órdenes
+(`expireStaleOrders`) cada 60 s, que expira las pendientes vencidas y restaura stock.
+
+### 9.1 Levantar el stack completo (backend + frontend)
+
+Dos terminales, una por proceso:
+
+```powershell
+# Terminal 1 — backend (http://localhost:3000, API en /api)
+cd "BACK/lia-store"; npm run dev
+
+# Terminal 2 — frontend (http://localhost:5173)
+cd "FRONT/damiana-bella"; npm run dev
+```
+
+El frontend vive en `../../FRONT/damiana-bella` (repo git propio) y apunta acá con
+`VITE_API_URL_LOCAL=http://localhost:3000/api`.
+
+### 9.2 Problemas frecuentes en local
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| El proceso sale con `❌ No se pudo iniciar el servidor` | `DB_*` mal, proyecto Supabase pausado o sin red | Revisar credenciales; despausar el proyecto en Supabase |
+| `503` en `/api/orders/mp-preference` o `mp-confirm` | Falta `MP_ACCESS_TOKEN` | Cargarlo en `.env` y reiniciar |
+| `401` en rutas protegidas con un token válido | Faltan `SUPABASE_URL` / `SUPABASE_ANON_KEY` | Cargarlas en `.env` y reiniciar |
+| El navegador bloquea las requests por CORS | Front en un origen no permitido con `NODE_ENV=production` | Usar `NODE_ENV=development` en local o sumar el origen a `FRONTEND_URL` (CSV, sin espacios) |
+| `relation "profiles" does not exist` | BD nueva sin esquema | `npm run init-db` |
+| El front pega a un puerto que nadie escucha | Vite tomó 5174 y/o `VITE_API_URL_LOCAL` desactualizada | Verificar el puerto real que imprime Vite y la URL del `.env.local` del front |
+
+> **Antes de integrar contratos con el frontend, leé la §11.**
 
 ---
 

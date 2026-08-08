@@ -6,15 +6,24 @@ const { pool } = require('../config/database');
  * por el caller; los demás manejan su propia conexión.
  */
 class Order {
-  /** Compras pagadas de un usuario, más recientes primero. */
-  static async findPaidByEmail(email) {
+  /**
+   * Compras pagadas de un usuario, más recientes primero, paginadas.
+   * El total viaja en la misma consulta (`COUNT(*) OVER()`) para no pagar un
+   * segundo round trip por request.
+   * @returns {Promise<{rows: object[], total: number}>}
+   */
+  static async findPaidByEmail(email, limit, offset) {
     const result = await pool.query(
-      `SELECT * FROM public.ventas
-       WHERE LOWER(buyer_email) = LOWER($1) AND payment_status = 'pagado'
-       ORDER BY created_at DESC`,
-      [email]
+      `SELECT *, COUNT(*) OVER()::int AS total_count
+         FROM public.ventas
+        WHERE LOWER(buyer_email) = LOWER($1) AND payment_status = 'pagado'
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3`,
+      [email, limit, offset]
     );
-    return result.rows;
+
+    const rows = result.rows.map(({ total_count, ...order }) => order);
+    return { rows, total: rows.length > 0 ? result.rows[0].total_count : 0 };
   }
 
   /** Bloquea la fila de la orden para actualizarla dentro de una transacción. */

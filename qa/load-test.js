@@ -68,11 +68,12 @@ async function sequentialRun(label, steps) {
 
 // ─── Escenarios ───────────────────────────────────────────────────────────────
 
-async function getProducts()      { return fetch(`${API}/products`); }
-async function getProductById(id) { return fetch(`${API}/products/${id}`); }
-async function getCarousel(type)  { return fetch(`${API}/products/carousel?type=${type}`); }
-async function getShipping(cp)    { return fetch(`${API}/shipping?cp=${cp}`); }
-async function getSiteContent(k)  { return fetch(`${API}/site-content/${k}`); }
+async function getProducts()       { return fetch(`${API}/products`); }
+async function getProductPage(o)   { return fetch(`${API}/products?limit=12&offset=${o}`); }
+async function getProductById(id)  { return fetch(`${API}/products/${id}`); }
+async function getShipping(cp)     { return fetch(`${API}/shipping?postalCode=${cp}`); }
+async function getCloudinaryCfg()  { return fetch(`${API}/cloudinary/config`); }
+async function getHealth()         { return fetch(`${BASE}/health`); }
 
 const RESULTS = [];
 
@@ -111,17 +112,19 @@ async function suiteProductDetail() {
   ));
 }
 
-// ─── Suite 3: carrusel + contenido de home ────────────────────────────────────
+// ─── Suite 3: apertura de home concurrente ───────────────────────────────────
 async function suiteHomeConcurrent() {
   console.log('\n══════════════════════════════════════════════════════');
-  console.log(' SUITE 3 — Home concurrente (carrusel + site-content)');
+  console.log(' SUITE 3 — Home concurrente (catálogo + envío + config)');
   console.log('══════════════════════════════════════════════════════');
 
+  // Simula lo que dispara una apertura de home contra ESTE backend: primera
+  // página del catálogo, cotización de envío y config pública de Cloudinary.
   const homeLoads = Array.from({ length: 20 }, async () => {
     const [r1, r2, r3] = await Promise.all([
-      timed(() => getCarousel('desktop')),
-      timed(() => getSiteContent('footer')),
-      timed(() => getSiteContent('about')),
+      timed(() => getProductPage(0)),
+      timed(() => getShipping('1406')),
+      timed(() => getCloudinaryCfg()),
     ]);
     const ok = r1.ok && r2.ok && r3.ok;
     const maxDuration = Math.max(r1.durationMs, r2.durationMs, r3.durationMs);
@@ -197,7 +200,7 @@ async function suiteStockRaceDetect() {
 
   const ok      = results.filter(r => r.ok);
   const bodies  = await Promise.all(
-    ok.map(async (_, i) => {
+    ok.map(async () => {
       try {
         const r   = await fetch(`${API}/products/${productId}`);
         const j   = await r.json();
@@ -234,6 +237,74 @@ async function suiteShippingConcurrent() {
     30,
     () => getShipping(concurrentCPs[Math.floor(Math.random() * concurrentCPs.length)])
   ));
+}
+
+// ─── Suite 7: mecanismos de carga (caché HTTP, 304, rate limit) ──────────────
+async function suiteLoadMechanics() {
+  console.log('\n══════════════════════════════════════════════════════');
+  console.log(' SUITE 7 — Mecanismos de carga (caché HTTP / 304 / 429)');
+  console.log('══════════════════════════════════════════════════════');
+
+  // 1. Cabeceras de caché + ETag en el catálogo público
+  const first = await fetch(`${API}/products?limit=5&offset=0`);
+  const cacheControl = first.headers.get('cache-control');
+  const etag = first.headers.get('etag');
+  console.log(`  ${cacheControl ? '✅' : '❌'} Cache-Control: ${cacheControl ?? 'ausente'}`);
+  console.log(`  ${etag ? '✅' : '❌'} ETag: ${etag ? 'presente' : 'ausente'}`);
+
+  // 2. Revalidación condicional → 304 sin cuerpo.
+  //    `cache: 'no-cache'` es necesario porque el fetch de Node (undici) descarta
+  //    los headers condicionales en el modo por defecto; el navegador sí los manda.
+  let notModified = false;
+  if (etag) {
+    const revalidated = await fetch(`${API}/products?limit=5&offset=0`, {
+      headers: { 'If-None-Match': etag },
+      cache: 'no-cache',
+    });
+    notModified = revalidated.status === 304;
+    console.log(`  ${notModified ? '✅' : '❌'} Revalidación con If-None-Match → ${revalidated.status}`);
+  }
+
+  // 3. Compresión negociada
+  const compressed = await fetch(`${API}/products`, { headers: { 'Accept-Encoding': 'gzip' } });
+  const encoding = compressed.headers.get('content-encoding');
+  console.log(`  ${encoding ? '✅' : '⚠️ '} Content-Encoding: ${encoding ?? 'sin comprimir (payload chico)'}`);
+
+  // 4. Rate limit: headers estándar y bloqueo con 429 + Retry-After.
+  //    Se usa el endpoint de login, que tiene el límite más estricto (10/min).
+  const loginAttempt = () =>
+    fetch(`${API}/users/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'load-test@example.com', password: 'invalido' }),
+    });
+
+  const attempts = [];
+  for (let i = 0; i < 14; i += 1) attempts.push(await loginAttempt());
+
+  const blocked = attempts.filter(r => r.status === 429);
+  const last = attempts.at(-1);
+  const hasLimitHeaders = Boolean(last.headers.get('x-ratelimit-limit'));
+  const hasRetryAfter = Boolean(last.headers.get('retry-after'));
+
+  console.log(`  ${blocked.length > 0 ? '✅' : '❌'} 14 logins seguidos → ${blocked.length} bloqueados con 429`);
+  console.log(`  ${hasLimitHeaders ? '✅' : '❌'} Headers X-RateLimit-* presentes`);
+  console.log(`  ${hasRetryAfter ? '✅' : '❌'} Retry-After presente en el 429`);
+
+  // 5. Health check con métricas de pool/concurrencia
+  const health = await (await getHealth()).json();
+  const hasMetrics = Boolean(health.db && health.concurrency && health.caches);
+  console.log(`  ${hasMetrics ? '✅' : '❌'} /health expone db + concurrencia + cachés`);
+  if (hasMetrics) {
+    console.log(`     pool: total=${health.db.total} idle=${health.db.idle} waiting=${health.db.waiting}`);
+    console.log(`     bulkhead: aceptadas=${health.concurrency.accepted} encoladas=${health.concurrency.totalQueued} en cola ahora=${health.concurrency.queueLength} rechazadas=${health.concurrency.rejected}`);
+    const products = health.caches.find(c => c.name === 'products');
+    if (products) console.log(`     caché products: hits=${products.hits} misses=${products.misses} coalesced=${products.coalesced}`);
+  }
+
+  const passed = [cacheControl, etag, notModified, blocked.length > 0, hasLimitHeaders, hasRetryAfter, hasMetrics]
+    .filter(Boolean).length;
+  RESULTS.push({ label: 'Mecanismos de carga (7 checks)', ok: passed, total: 7, errors: 7 - passed });
 }
 
 // ─── Resumen final ────────────────────────────────────────────────────────────
@@ -291,6 +362,7 @@ function printSummary() {
   await suiteRapidNavigation();
   await suiteStockRaceDetect();
   await suiteShippingConcurrent();
+  await suiteLoadMechanics();
 
   printSummary();
 })();

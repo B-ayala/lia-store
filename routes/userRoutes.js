@@ -12,11 +12,24 @@ const {
   signupRateLimit
 } = require('../controllers/userController');
 const { authMiddleware, adminMiddleware } = require('../middleware/authMiddleware');
+const { createRateLimit } = require('../middleware/rateLimit');
+const { noStore } = require('../middleware/httpCache');
+
+// Login: cada intento dispara una llamada a Supabase Auth + una query. Es el
+// endpoint clásico de fuerza bruta, así que lleva el límite más estricto.
+const loginLimit = createRateLimit({ name: 'users-login', windowMs: 60 * 1000, max: 10 });
+
+// Endpoints auxiliares del signup: se llaman en cada tecleo del formulario en
+// algunos flujos, por eso un techo más alto pero acotado.
+const signupLimit = createRateLimit({ name: 'users-signup', windowMs: 60 * 1000, max: 60 });
+
+// Datos de usuarios: nunca cacheables (PII).
+router.use(noStore);
 
 // ─── Públicas (flujo de signup/login, pre-auth) ───
-router.post('/login', loginUser);
-router.get('/signup-status/:email', signupStatus);
-router.post('/signup-ratelimit', signupRateLimit);
+router.post('/login', loginLimit, loginUser);
+router.get('/signup-status/:email', signupLimit, signupStatus);
+router.post('/signup-ratelimit', signupLimit, signupRateLimit);
 
 // ─── Protegidas (admin) ───
 router.get('/auth/:userId', authMiddleware, adminMiddleware, getUserByAuthId);

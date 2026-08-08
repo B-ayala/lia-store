@@ -1,4 +1,33 @@
 const { pool } = require('../config/database');
+const { caches, TTL, invalidateProducts } = require('../utils/cache');
+
+const logger = require('../utils/logger');
+
+const MAX_PAGE_SIZE = 100;
+const DEFAULT_PAGE_SIZE = 50;
+
+/**
+ * Responde un error de servidor sin exponer internals.
+ *
+ * Los errores de `pg` traen detalle de infraestructura (por ejemplo
+ * `EMAXCONNSESSION ... pool_size: 15`, que revela el dimensionamiento de la
+ * base). Eso va al log estructurado, no al cliente.
+ */
+const serverError = (res, action, error) => {
+  logger.error(`products_${action}_failed`, { error: error.message, code: error.code });
+  return res.status(500).json({
+    success: false,
+    code: 'INTERNAL_ERROR',
+    message: 'No se pudo completar la operación. Reintentá en unos segundos.',
+  });
+};
+
+/** Entero saneado dentro de [min, max]; cae al default si no es válido. */
+const boundedInt = (raw, fallback, min, max) => {
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(value, min), max);
+};
 
 // Create product
 const createProduct = async (req, res) => {
@@ -61,49 +90,66 @@ const createProduct = async (req, res) => {
       ]
     );
 
+    invalidateProducts();
+
     res.status(201).json({
       success: true,
       data: result.rows[0],
     });
   } catch (error) {
-    console.error('Create product error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return serverError(res, 'create', error);
   }
+};
+
+/**
+ * Página del catálogo en UNA sola consulta: `COUNT(*) OVER()` devuelve el total
+ * junto con las filas y evita el segundo round trip (dos queries por request se
+ * notan cuando hay decenas de lectores simultáneos).
+ */
+const fetchProductPage = async (limit, offset) => {
+  const result = await pool.query(
+    `SELECT *, COUNT(*) OVER()::int AS total_count
+       FROM public.productos
+      ORDER BY created_at DESC, id DESC
+      LIMIT $1 OFFSET $2`,
+    [limit, offset]
+  );
+
+  const rows = result.rows.map(({ total_count, ...product }) => product);
+  if (rows.length > 0) return { rows, total: result.rows[0].total_count };
+
+  // Página vacía (offset fuera de rango): `COUNT(*) OVER()` no devuelve nada,
+  // así que el total se resuelve aparte para no reportar 0 productos de más.
+  const countResult = await pool.query('SELECT COUNT(*)::int AS total FROM public.productos');
+  return { rows, total: countResult.rows[0].total };
 };
 
 // Get all products
 const getProducts = async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = boundedInt(req.query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
+    const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
-    const countResult = await pool.query('SELECT COUNT(*) FROM public.productos');
-    const total = parseInt(countResult.rows[0].count);
-
-    const result = await pool.query(
-      `SELECT * FROM public.productos
-       ORDER BY created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
+    // Caché + single-flight: una ráfaga de lecturas de la misma página ejecuta
+    // una sola query y comparte el resultado. Se invalida ante cualquier cambio
+    // de producto o de stock (ver invalidateProducts).
+    const { rows, total } = await caches.products.getOrSet(
+      `list:${limit}:${offset}`,
+      TTL.products,
+      () => fetchProductPage(limit, offset)
     );
 
     res.json({
       success: true,
-      data: result.rows,
-      count: result.rows.length,
+      data: rows,
+      count: rows.length,
       total,
       limit,
       offset,
+      hasMore: offset + rows.length < total,
     });
   } catch (error) {
-    console.error('Get products error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return serverError(res, 'list', error);
   }
 };
 
@@ -112,12 +158,15 @@ const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const result = await pool.query(
-      'SELECT * FROM public.productos WHERE id = $1',
-      [id]
-    );
+    // El detalle de un producto "popular" concentra muchas lecturas iguales:
+    // es el caso donde más rinde el coalescing. `null` marca "no existe" y
+    // también se cachea, para que un scraper de IDs inexistentes no golpee la BD.
+    const product = await caches.products.getOrSet(`detail:${id}`, TTL.products, async () => {
+      const result = await pool.query('SELECT * FROM public.productos WHERE id = $1', [id]);
+      return result.rows[0] || null;
+    });
 
-    if (result.rows.length === 0) {
+    if (!product) {
       return res.status(404).json({
         success: false,
         message: 'Producto no encontrado',
@@ -126,14 +175,10 @@ const getProductById = async (req, res) => {
 
     res.json({
       success: true,
-      data: result.rows[0],
+      data: product,
     });
   } catch (error) {
-    console.error('Get product error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return serverError(res, 'detail', error);
   }
 };
 
@@ -270,16 +315,14 @@ const updateProduct = async (req, res) => {
       });
     }
 
+    invalidateProducts();
+
     res.json({
       success: true,
       data: result.rows[0],
     });
   } catch (error) {
-    console.error('Update product error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return serverError(res, 'update', error);
   }
 };
 
@@ -314,7 +357,7 @@ const deleteProduct = async (req, res) => {
       );
       imageSharedWithOther = shared.rows.length > 0;
       if (imageSharedWithOther) {
-        console.warn(`Imagen ${productData.public_id} compartida con otro producto; no se elimina de Cloudinary.`);
+        logger.warn('cloudinary_asset_shared', { publicId: productData.public_id });
       }
     }
 
@@ -364,7 +407,7 @@ const deleteProduct = async (req, res) => {
           request.end();
         });
       } catch (cloudinaryError) {
-        console.warn('Cloudinary deletion warning:', cloudinaryError.message);
+        logger.warn('cloudinary_delete_failed', { error: cloudinaryError.message });
         // Don't fail if Cloudinary deletion fails, just warn
       }
     }
@@ -372,16 +415,14 @@ const deleteProduct = async (req, res) => {
     // Delete from PostgreSQL
     await pool.query('DELETE FROM public.productos WHERE id = $1', [id]);
 
+    invalidateProducts();
+
     res.json({
       success: true,
       message: 'Producto eliminado exitosamente',
     });
   } catch (error) {
-    console.error('Delete product error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return serverError(res, 'delete', error);
   }
 };
 

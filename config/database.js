@@ -1,5 +1,10 @@
 const { Pool } = require('pg');
 
+const parseIntEnv = (name, fallback) => {
+  const value = Number.parseInt(process.env[name], 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -9,10 +14,20 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false
   },
-  // Configuración del pool
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
+  // Configuración del pool. El techo real lo pone Supabase: su pooler en modo
+  // sesión limita el proyecto a 15 clientes y devuelve `EMAXCONNSESSION` al
+  // pasarse (verificado en carga con 800 requests concurrentes). Se deja margen
+  // para migraciones y psql manual. Subir esto sin subir el pool_size de
+  // Supabase sólo cambia un error de cola por un error del servidor.
+  max: parseIntEnv('DB_POOL_MAX', 12),
+  min: parseIntEnv('DB_POOL_MIN', 2),
+  idleTimeoutMillis: parseIntEnv('DB_IDLE_TIMEOUT_MS', 30000),
+  connectionTimeoutMillis: parseIntEnv('DB_CONNECTION_TIMEOUT_MS', 5000),
+  // Una query colgada mantiene ocupada una conexión del pool y, en carga, se
+  // lleva puesto al resto. Con estos timeouts falla rápido y libera el slot.
+  statement_timeout: parseIntEnv('DB_STATEMENT_TIMEOUT_MS', 10000),
+  query_timeout: parseIntEnv('DB_QUERY_TIMEOUT_MS', 10000),
+  keepAlive: true,
 });
 
 let isConnected = false;
@@ -87,4 +102,21 @@ const isDBConnected = () => {
   return isConnected;
 };
 
-module.exports = { connectDB, pool, isDBConnected };
+/**
+ * Estado del pool para el health check: `waiting > 0` sostenido significa que
+ * la concurrencia entrante supera a las conexiones disponibles.
+ */
+const getPoolStats = () => ({
+  total: pool.totalCount,
+  idle: pool.idleCount,
+  waiting: pool.waitingCount,
+  max: pool.options.max,
+});
+
+/** Cierra el pool al apagar el proceso (deploy de Railway envía SIGTERM). */
+const closeDB = async () => {
+  isConnected = false;
+  await pool.end();
+};
+
+module.exports = { connectDB, pool, isDBConnected, getPoolStats, closeDB };

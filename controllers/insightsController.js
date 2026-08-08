@@ -1,4 +1,5 @@
 const Insights = require('../models/Insights');
+const { caches, TTL } = require('../utils/cache');
 
 /**
  * Endpoints de analítica del asistente del panel admin.
@@ -35,10 +36,29 @@ const parseBoundedInt = (raw, fallback, min, max) => {
   return Math.min(Math.max(n, min), max);
 };
 
-const ok = (res, insight) =>
+/**
+ * Ejecuta una consulta de analítica con caché de corta duración y single-flight.
+ *
+ * Son agregaciones sobre `ventas` (GROUP BY, window functions) mucho más caras
+ * que un SELECT por id, y el asistente del panel las dispara de a varias por
+ * pantalla. Con caché por consulta, abrir el panel varias veces —o dos admins a
+ * la vez— no multiplica el costo en la base.
+ *
+ * `generatedAt` viaja DENTRO del valor cacheado: el frontend muestra el momento
+ * real del dato, no el de la respuesta HTTP.
+ *
+ * @returns {Promise<{data: any, generatedAt: string}>}
+ */
+const cachedQuery = (key, loader) =>
+  caches.insights.getOrSet(key, TTL.insights, async () => ({
+    data: await loader(),
+    generatedAt: new Date().toISOString(),
+  }));
+
+const ok = (res, insight, generatedAt) =>
   res.status(200).json({
     success: true,
-    insight: { ...insight, generatedAt: new Date().toISOString() },
+    insight: { ...insight, generatedAt },
   });
 
 const fail = (res, action) => (error) => {
@@ -51,7 +71,9 @@ const fail = (res, action) => (error) => {
 const getLowStock = async (req, res) => {
   try {
     const threshold = parseBoundedInt(req.query.threshold, LOW_STOCK_DEFAULT_THRESHOLD, 1, 100);
-    const rows = await Insights.lowStock(threshold, TABLE_ROW_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery(`low-stock:${threshold}`, () =>
+      Insights.lowStock(threshold, TABLE_ROW_LIMIT)
+    );
     const outOfStock = rows.filter((r) => r.stock <= 0).length;
 
     return ok(res, {
@@ -74,7 +96,7 @@ const getLowStock = async (req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Generar reposición', to: '/admin/products' }],
       emptyText: 'Ningún producto por debajo del umbral. Stock saludable. 🎉',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'low-stock')(error);
   }
@@ -82,7 +104,9 @@ const getLowStock = async (req, res) => {
 
 const getSalesToday = async (_req, res) => {
   try {
-    const { summary, items } = await Insights.salesToday(TABLE_ROW_LIMIT);
+    const { data: { summary, items }, generatedAt } = await cachedQuery('sales-today', () =>
+      Insights.salesToday(TABLE_ROW_LIMIT)
+    );
 
     return ok(res, {
       id: 'sales-today',
@@ -105,7 +129,7 @@ const getSalesToday = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Ver todas las ventas', to: '/admin/sales' }],
       emptyText: 'Todavía no hay ventas pagadas hoy. El día recién empieza. ☕',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'sales-today')(error);
   }
@@ -113,7 +137,9 @@ const getSalesToday = async (_req, res) => {
 
 const getPendingPayment = async (_req, res) => {
   try {
-    const rows = await Insights.pendingPayment(TABLE_ROW_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery('pending-payment', () =>
+      Insights.pendingPayment(TABLE_ROW_LIMIT)
+    );
     const potential = rows.reduce((sum, r) => sum + Number(r.total_price || 0), 0);
     const byMp = rows.filter((r) => r.payment_method === 'mp').length;
 
@@ -139,7 +165,7 @@ const getPendingPayment = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Gestionar en Ventas', to: '/admin/sales' }],
       emptyText: 'No hay pedidos esperando pago. Todo al día. ✅',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'pending-payment')(error);
   }
@@ -147,7 +173,9 @@ const getPendingPayment = async (_req, res) => {
 
 const getPendingPickups = async (_req, res) => {
   try {
-    const rows = await Insights.pendingPickups(TABLE_ROW_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery('pending-pickups', () =>
+      Insights.pendingPickups(TABLE_ROW_LIMIT)
+    );
     const amount = sum(rows, 'total_price');
     const oldest = maxOf(rows, 'age_seconds');
 
@@ -173,7 +201,7 @@ const getPendingPickups = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Ver en Ventas', to: '/admin/sales' }],
       emptyText: 'No hay retiros por WhatsApp pendientes de confirmar. 👌',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'pending-pickups')(error);
   }
@@ -181,7 +209,9 @@ const getPendingPickups = async (_req, res) => {
 
 const getTopProducts = async (_req, res) => {
   try {
-    const rows = await Insights.topProducts(TOP_PRODUCTS_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery('top-products', () =>
+      Insights.topProducts(TOP_PRODUCTS_LIMIT)
+    );
     const maxQty = rows.reduce((max, r) => Math.max(max, Number(r.qty || 0)), 0) || 1;
     const totalUnits = rows.reduce((sum, r) => sum + Number(r.qty || 0), 0);
     const totalRevenue = rows.reduce((sum, r) => sum + Number(r.revenue || 0), 0);
@@ -216,7 +246,7 @@ const getTopProducts = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Ver productos', to: '/admin/products' }],
       emptyText: 'Aún no hay ventas pagadas este mes para rankear.',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'top-products')(error);
   }
@@ -224,7 +254,9 @@ const getTopProducts = async (_req, res) => {
 
 const getSalesGrowth = async (_req, res) => {
   try {
-    const rows = await Insights.salesGrowth(TOP_PRODUCTS_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery('sales-growth', () =>
+      Insights.salesGrowth(TOP_PRODUCTS_LIMIT)
+    );
     const maxGrowth = maxOf(rows, 'growth') || 1;
     const tableRows = rows.map((r, index) => ({
       rank: index + 1,
@@ -254,7 +286,7 @@ const getSalesGrowth = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Ver productos', to: '/admin/products' }],
       emptyText: 'Ningún producto creció respecto al mes anterior todavía.',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'sales-growth')(error);
   }
@@ -262,7 +294,9 @@ const getSalesGrowth = async (_req, res) => {
 
 const getPickupsToConfirm = async (_req, res) => {
   try {
-    const rows = await Insights.pickupsToConfirm(TABLE_ROW_LIMIT);
+    const { data: rows, generatedAt } = await cachedQuery('pickups-to-confirm', () =>
+      Insights.pickupsToConfirm(TABLE_ROW_LIMIT)
+    );
 
     return ok(res, {
       id: 'pickups-to-confirm',
@@ -285,7 +319,7 @@ const getPickupsToConfirm = async (_req, res) => {
       },
       actions: [{ type: 'navigate', label: 'Ir a Despachos', to: '/admin/dispatches' }],
       emptyText: 'No hay retiros pagados esperando confirmación. 👌',
-    });
+    }, generatedAt);
   } catch (error) {
     return fail(res, 'pickups-to-confirm')(error);
   }

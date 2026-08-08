@@ -3,6 +3,93 @@
 ## [Unreleased]
 
 ### Added
+- **Manejo de concurrencia y carga en toda la API** (ver
+  `docs/flows/flow-concurrencia-carga.md`, casos QA `TC-180`–`TC-193`):
+  - **Control de concurrencia (bulkhead + cola)**: como máximo
+    `MAX_CONCURRENT_REQUESTS` handlers tocan la base a la vez; el excedente
+    espera en una cola acotada y, si se llena, recibe **503 `SERVER_BUSY` con
+    `Retry-After`** en lugar de degradarse en timeouts.
+  - **Caché en memoria con TTL y single-flight** para catálogo, detalle de
+    producto y analítica admin: N lecturas simultáneas iguales ejecutan una sola
+    query. Se invalida automáticamente ante cualquier cambio de producto o stock
+    (alta/edición/baja, reserva, cancelación, pago tardío, sweep de expiración).
+  - **Caché de verificación de token** (`CACHE_TTL_AUTH_SECONDS`, 30 s): evita un
+    round trip HTTPS a Supabase Auth + una query a `profiles` en cada request
+    autenticada. Sólo se cachean verificaciones exitosas.
+  - **Rate limiting por endpoint** (ventana deslizante) con `429`,
+    `Retry-After` y headers `X-RateLimit-*`: login 10/min, checkout 12/min,
+    insights 60/min, catálogo 600/min, más un techo global de 1200/min.
+  - **Caché HTTP**: `Cache-Control` + `ETag` en endpoints públicos (catálogo,
+    envío, config de Cloudinary) → revalidaciones responden **304 sin cuerpo**.
+    `no-store` explícito en órdenes, usuarios, insights y Cloudinary admin.
+  - **Compresión gzip** de las respuestas (nueva dependencia `compression`).
+  - **Paginación** en `GET /api/orders/user` (`limit`/`offset`/`total`/`hasMore`,
+    default 200, máx. 500) y tope de 50 ítems por compra.
+  - **Apagado ordenado** ante `SIGTERM`/`SIGINT`: deja de aceptar, drena las
+    requests en vuelo y cierra el pool (evita cortar compras en cada deploy).
+  - **`GET /health` con métricas** de pool, bulkhead, rate limit y cachés; queda
+    fuera del rate limit y del bulkhead para poder diagnosticar bajo saturación.
+  - Timeouts de servidor (`keepAlive` 65 s, `requestTimeout` 30 s) y de base
+    (`statement_timeout` / `query_timeout` 10 s), y límite de body de 256 kb con
+    respuestas tipadas `413 PAYLOAD_TOO_LARGE` / `400 INVALID_JSON`.
+- **Índices de soporte** en `db/migrations/2026-08-08_add_performance_indexes.sql`
+  para las consultas calientes de `ventas` y `productos` (idempotentes).
+- `qa/load-test.js`: nueva SUITE 7 que verifica caché HTTP, 304, compresión,
+  rate limit y métricas de `/health`.
+
+### Changed
+- `DB_POOL_MAX` baja de 20 a **12**: el pooler de Supabase en modo sesión limita
+  el proyecto a 15 clientes y devolvía `EMAXCONNSESSION` bajo carga (36 errores
+  reproducidos con 800 requests concurrentes; con 12 el mismo escenario da 0).
+  Todo el tuning del pool pasa a ser configurable por entorno.
+- `POST /api/orders/mp-preference`: la llamada a Mercado Pago sale **fuera** de
+  la transacción, que ahora es corta (reservar stock → COMMIT → llamar a MP). Si
+  MP falla, se compensa cancelando las reservas y devolviendo el stock. El
+  contrato y los estados observables no cambian; antes cada checkout retenía una
+  conexión del pool durante todo el round trip externo.
+- Creación de órdenes (MP y transferencia): las requests duplicadas del mismo
+  usuario con el mismo carrito que llegan mientras la primera sigue en vuelo
+  comparten esa ejecución, en vez de crear dos juegos de ventas y descontar
+  stock dos veces (doble click en "Pagar").
+- `GET /api/products`: el total viaja en la misma consulta (`COUNT(*) OVER()`),
+  eliminando el segundo round trip por request, y la respuesta suma `hasMore`.
+- Logs del servidor pasan a formato estructurado JSON en producción
+  (`utils/logger.js`, nivel configurable con `LOG_LEVEL`).
+- `authMiddleware`: "Usuario no encontrado en la base de datos" se unifica en
+  "Token inválido o expirado" (no revela si el perfil existe).
+
+### Fixed
+- Los errores 500 de `productController` devolvían `error.message` crudo, lo que
+  filtraba detalle de infraestructura al cliente (por ejemplo el `pool_size` de
+  Supabase). Ahora responden `{ code: 'INTERNAL_ERROR' }` genérico y el detalle
+  va al log.
+- `middleware/concurrencyLimit.js`: un cliente que se desconectaba mientras su
+  request esperaba en la cola dejaba el slot tomado (el evento `close` ya había
+  ocurrido antes de registrar los listeners de liberación).
+- `Bulkhead.stats()` pisaba la profundidad instantánea de la cola con el
+  contador acumulado del mismo nombre; ahora son `queueLength` y `totalQueued`.
+- `controllers/cloudinaryController.js`: se elimina el `console.log` que imprimía
+  la firma generada para Cloudinary.
+- `qa/load-test.js`: las suites 3 y 6 apuntaban a endpoints que este backend no
+  expone (`/products/carousel`, `/site-content`) y usaban `?cp=` en vez de
+  `?postalCode=`, por lo que reportaban 100% de error de forma permanente.
+- `npm audit`: `body-parser` actualizado (advisory de DoS al deshabilitarse
+  silenciosamente el límite de tamaño). Sin vulnerabilidades abiertas.
+- `DOCUMENTACION_BACKEND.md` §8: la tabla de variables de entorno suma `SUPABASE_URL`,
+  `SUPABASE_ANON_KEY`, `MP_ACCESS_TOKEN` y `MP_WEBHOOK_URL` (estaban en uso pero sin
+  documentar) y aclara el comportamiento de CORS en desarrollo.
+- `DOCUMENTACION_BACKEND.md` §9 "Cómo levantar el proyecto": Node 22.x, comandos completos,
+  nota sobre el arranque bloqueante por conexión a BD y el sweep de órdenes, nuevas
+  §9.1 (stack completo backend + frontend) y §9.2 (tabla de problemas frecuentes en local).
+
+### Added
+- **Documentación del despliegue a producción** (`docs/flows/flow-despliegue-produccion.md`):
+  cadena dominio → DNS → hosting → CORS, con diagrama, tabla de variables de entorno por
+  panel, comandos de verificación y tabla de síntomas → causa → dónde se arregla.
+- `.env.example` documenta que `FRONTEND_URL` acepta **varios orígenes separados por coma**
+  y que en producción deben listarse todos los dominios del front. El código ya lo soportaba
+  (`split(',')` en `config/cors.js`), pero el ejemplo mostraba una sola URL: quien desplegara
+  a partir de él se quedaba sin CORS contra los dominios reales.
 - **Analítica del asistente admin** (`/api/admin/insights/*`, solo-admin con
   `authMiddleware + adminMiddleware`, solo lectura): cinco endpoints que devuelven un
   envelope uniforme `{ success, insight }` con métricas, tabla y acción sugerida:
@@ -144,6 +231,13 @@
 - **Auth bypass cerrado:** `authMiddleware` validaba el JWT con `jwt.decode` (sin verificar
   firma), por lo que un token falsificado con `sub`/rol de admin pasaba. Ahora la firma se
   verifica contra Supabase; un token forjado responde `401`.
+- `.gitignore` cubría `.env`, `.env.local` y `.env.*.local`, pero **no** `.env.production`
+  ni `.env.staging`: un archivo con credenciales de producción se podía commitear sin que
+  git lo frenara. Se reemplazó por `.env.*` con excepción explícita `!.env.example`, de modo
+  que cualquier variante futura queda ignorada por defecto. Se agregaron además `.claude/`,
+  `.playwright-mcp/` y capturas de pantalla (`*.png`, `*.jpg`, `*.jpeg`, `*.webp`), que el
+  repo raíz ya ignoraba y este no. Verificado con `git check-ignore`; no había ningún
+  secreto trackeado.
 
 ---
 
