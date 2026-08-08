@@ -30,9 +30,11 @@ build/
 temp/
 tmp/
 
-# Base de datos
+# Base de datos — dumps y backups fuera del repo…
 *.sql
 backup.sql
+# …pero las migraciones SÍ se versionan: son parte del esquema, no un dump.
+!db/migrations/*.sql
 
 # Sistema operativo
 .DS_Store
